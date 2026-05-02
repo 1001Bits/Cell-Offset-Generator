@@ -49,11 +49,23 @@ constexpr PatchSite kPatchSitesOG_1_10_163[] = {
     { 0x140491F16, 2, "FindCellInFile",        Group::Lookup, { 0x74, 0x63 } },
     { 0x1404924FC, 2, "FindInFileFast",        Group::Lookup, { 0x74, 0x48 } },
     { 0x1403BD60F, 2, "Cell::FindInFileFast",  Group::Lookup, { 0x74, 0x72 } },
-    // Interior-cell hook: ungate fileOffset capture in CellLoader (vfunc) so
-    // ESPs reach the existing TESFile::SetInteriorOffsetForCell write path
-    // (engine already maintains a per-file formID→offset array at file+0x3B8).
-    // Without this, ESP interior cells won't accelerate.
-    { 0x1403AD165, 2, "CellLoader.intCapture", Group::Load,   { 0x74, 0x07 } },
+    // ── INTENTIONALLY OMITTED: CellLoader.intCapture (was 0x1403AD165) ──────
+    // Mirrors NVSE intent: ESMs get interior optimization, ESPs don't.
+    //
+    // Vanilla F4 already maintains a per-file formID→offset array for interior
+    // cells at TESFile+0x3B8 — but the write site is IsMaster-gated. Masters
+    // pass the check unconditionally (so vanilla F4 already optimizes ESM
+    // interiors); ESPs are blocked. We previously NOPed this gate to extend
+    // the optimization to ESPs, but that path mirrors the Skyrim port bug
+    // WallSoGB explicitly avoided in InteriorOffsets.hpp:
+    //   "ESP makes cell contents always loaded ... only master files have
+    //    offsets" — writing offsets into ESP interior cells triggers engine
+    // teardown paths vanilla never exercises, corrupting reference state in
+    // a way that's baked into the save (uninstalling doesn't unpoison).
+    //
+    // The Lookup-group `Cell::FindInFileFast` NOP above is safe even for ESPs
+    // because it's read-only — without entries written by intCapture, the
+    // ESP-interior read returns 0 and falls through to the slow path.
 };
 
 constexpr PatchSite kPatchSitesNG_1_10_984[] = {
@@ -65,7 +77,7 @@ constexpr PatchSite kPatchSitesNG_1_10_984[] = {
     { 0x14051E906, 2, "FindCellInFile",        Group::Lookup, { 0x74, 0x63 } },
     { 0x14051EEFC, 2, "FindInFileFast",        Group::Lookup, { 0x74, 0x48 } },
     { 0x140480353, 6, "Cell::FindInFileFast",  Group::Lookup, { 0x0F, 0x84, 0xB7, 0x00, 0x00, 0x00 } },
-    { 0x14046E66A, 2, "CellLoader.intCapture", Group::Load,   { 0x74, 0x07 } },
+    // CellLoader.intCapture intentionally omitted — see OG comment above.
 };
 
 constexpr PatchSite kPatchSitesAE[] = {
@@ -77,10 +89,7 @@ constexpr PatchSite kPatchSitesAE[] = {
     { 0x140572886, 2, "FindCellInFile",        Group::Lookup, { 0x74, 0x63 } },
     { 0x140572E7C, 2, "FindInFileFast",        Group::Lookup, { 0x74, 0x48 } },
     { 0x1404D41C3, 6, "Cell::FindInFileFast",  Group::Lookup, { 0x0F, 0x84, 0xB7, 0x00, 0x00, 0x00 } },
-    // Interior-cell hook — AE equivalent of OG's 0x14046E66A and VR's
-    // 0x140393955. Located in TESObjectCELL::Func10 at the JZ preceding
-    // `MOV R12D, [RBP+0x2C0]` (pattern `44 8B A5 C0 02 00 00`).
-    { 0x1404C24DA, 2, "CellLoader.intCapture", Group::Load,   { 0x74, 0x07 } },
+    // CellLoader.intCapture intentionally omitted — see OG comment above.
 };
 
 constexpr PatchSite kPatchSitesVR_1_2_72[] = {
@@ -92,8 +101,7 @@ constexpr PatchSite kPatchSitesVR_1_2_72[] = {
     { 0x14047B056, 2, "FindCellInFile",        Group::Lookup, { 0x74, 0x63 } },
     { 0x14047B63C, 2, "FindInFileFast",        Group::Lookup, { 0x74, 0x48 } },
     { 0x1403A3CDF, 2, "Cell::FindInFileFast",  Group::Lookup, { 0x74, 0x72 } },
-    // Interior-cell hook — see OG comment.
-    { 0x140393955, 2, "CellLoader.intCapture", Group::Load,   { 0x74, 0x07 } },
+    // CellLoader.intCapture intentionally omitted — see OG comment above.
 };
 
 [[nodiscard]] std::span<const PatchSite> PickPatchSites()
@@ -148,7 +156,7 @@ bool InstallEsmGateNops(const cog::Settings& a_settings)
     }
 
     if (!a_settings.enablePatches) {
-        logger::info("Patches: disabled via TOML [Patches] EnablePatches=false");
+        logger::info("Patches: disabled via Settings.enablePatches=false");
         return true;
     }
 
@@ -159,16 +167,12 @@ bool InstallEsmGateNops(const cog::Settings& a_settings)
 
     bool allOk = true;
     std::size_t applied = 0;
-    bool sawIntCapture = false;
     for (const auto& site : sites) {
-        if (std::string_view(site.name) == "CellLoader.intCapture") {
-            sawIntCapture = true;
-        }
         const bool enabled =
             (site.group == Group::Load   && a_settings.enableLoadGates) ||
             (site.group == Group::Lookup && a_settings.enableLookupGates);
         if (!enabled) {
-            logger::info("[{}] skipped (group disabled in TOML)", site.name);
+            logger::info("[{}] skipped (group disabled in settings)", site.name);
             continue;
         }
         if (VerifyAndPatch(site)) {
@@ -181,15 +185,6 @@ bool InstallEsmGateNops(const cog::Settings& a_settings)
     logger::info("Patches: {}/{} site(s) applied{}",
                  applied, sites.size(),
                  allOk ? "" : " — one or more failed verification");
-
-    // ESPs with interior cells still work without this gate, just slower
-    // (engine falls back to a linear scan instead of the cached fileOffset).
-    // Surface as a single warn so users don't think it's broken.
-    if (!sawIntCapture && a_settings.enableLoadGates) {
-        logger::warn("Patches: CellLoader.intCapture gate not yet located for "
-                     "this runtime — ESP interior cells will use the slow "
-                     "lookup path (exterior cells unaffected).");
-    }
     return allOk;
 }
 

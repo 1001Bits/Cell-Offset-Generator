@@ -38,6 +38,51 @@ constexpr std::uint32_t kMaxReasonableTableSize = 4 * 1024 * 1024;
                   / (std::string(a_world->GetFormEditorID()) + ".fco");
 }
 
+// xxh3 hashes are pure file I/O — independent across files, no engine state.
+// We parallelise hashing because for a stable load order it dominates Run()
+// wall-time (every plugin file is read end-to-end whether or not anything
+// needs regenerating). NVSE parallelises generation too via TESFile clones
+// (`GetThreadSafeFile`); CommonLibF4 doesn't expose that, so generation
+// stays serial — see Run().
+struct HashedFile
+{
+    RE::TESFile*  file;
+    std::uint64_t hash;
+};
+
+[[nodiscard]] std::vector<HashedFile> HashFilesParallel(
+    std::span<RE::TESFile* const> a_files)
+{
+    std::vector<HashedFile> out(a_files.size());
+    if (a_files.empty()) {
+        return out;
+    }
+
+    const auto hw = std::thread::hardware_concurrency();
+    const auto threadCount = std::clamp<std::size_t>(
+        hw == 0 ? 4 : hw, 1, std::min<std::size_t>(32, a_files.size()));
+
+    std::atomic<std::size_t> next{ 0 };
+    auto worker = [&]() {
+        while (true) {
+            const auto i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= a_files.size()) return;
+            out[i].file = a_files[i];
+            out[i].hash = HashFile(PluginPath(a_files[i]));
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(threadCount);
+    for (std::size_t i = 0; i < threadCount; ++i) {
+        workers.emplace_back(worker);
+    }
+    for (auto& w : workers) {
+        w.join();
+    }
+    return out;
+}
+
 }  // namespace
 
 std::filesystem::path Fo4Generator::GetCacheRoot() const
@@ -290,23 +335,41 @@ void Fo4Generator::Run()
     m_stats.totalFiles.store(static_cast<std::uint32_t>(targets.size()),
                              std::memory_order_relaxed);
 
-    logger::info("Generator: {} plugin(s) × {} worldspace(s) to consider",
-                 targets.size(), worlds.size());
+    // Phase 1: hash every plugin file in parallel. This is pure disk I/O on
+    // independent paths, no engine state involved.
+    const auto hashStart = clock::now();
+    auto hashed = HashFilesParallel(targets);
+    const auto hashMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           clock::now() - hashStart).count();
 
-    for (auto* file : targets) {
-        const auto pluginPath = PluginPath(file);
-        const auto fileHash = HashFile(pluginPath);
-        if (fileHash == 0) {
-            logger::warn("Generator: failed to hash {}, skipping", file->filename);
+    logger::info("Generator: hashed {} plugin(s) in {} ms (parallel) — "
+                 "now scanning × {} worldspace(s)",
+                 hashed.size(), hashMs, worlds.size());
+
+    // Phase 2: serial generation. Engine FindCellInFile mutates
+    // TESFile::fileoffset; without per-thread file clones (NVSE's
+    // GetThreadSafeFile, not exposed by CommonLibF4) we can't safely
+    // parallelise. Inter-file parallelism is also unsafe in practice — the
+    // engine's data handler isn't documented as reentrant.
+    const std::size_t totalFiles = hashed.size();
+    std::size_t fileIdx = 0;
+    for (const auto& hf : hashed) {
+        ++fileIdx;
+        if (hf.hash == 0) {
+            logger::warn("[{}/{}] {} — hash failed, skipping",
+                         fileIdx, totalFiles, hf.file->filename);
             m_stats.processedFiles.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
+
+        logger::info("[{}/{}] {} — scanning {} worldspace(s)",
+                     fileIdx, totalFiles, hf.file->filename, worlds.size());
 
         for (auto* world : worlds) {
             // GetFormArray<TESWorldSpace>() already returns TESWorldSpace*
             // — no As<> cast needed.
             if (world) {
-                ProcessWorld(file, fileHash, world);
+                ProcessWorld(hf.file, hf.hash, world);
             }
         }
         m_stats.processedFiles.fetch_add(1, std::memory_order_relaxed);
