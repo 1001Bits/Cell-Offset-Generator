@@ -17,6 +17,9 @@ struct EngineOffsets
     std::uintptr_t getIndexForCellCoord;
     std::uintptr_t getOffsetData;
     std::uintptr_t getOrCreateOffsetData;
+    // 0 means "not yet derived" — runtime falls back to serial generation.
+    std::uintptr_t getThreadSafeFile;
+    std::uintptr_t clearThreadSafeFiles;
 };
 
 constexpr EngineOffsets kOffsetsOG_1_10_163{
@@ -24,6 +27,8 @@ constexpr EngineOffsets kOffsetsOG_1_10_163{
     .getIndexForCellCoord  = 0x492270,
     .getOffsetData         = 0x4981F0,
     .getOrCreateOffsetData = 0x4982B0,
+    .getThreadSafeFile     = 0x1322B0,
+    .clearThreadSafeFiles  = 0x132430,
 };
 
 constexpr EngineOffsets kOffsetsNG_1_10_984{
@@ -31,6 +36,8 @@ constexpr EngineOffsets kOffsetsNG_1_10_984{
     .getIndexForCellCoord  = 0x51EC60,
     .getOffsetData         = 0x525590,
     .getOrCreateOffsetData = 0x525670,
+    .getThreadSafeFile     = 0x2A4ED0,
+    .clearThreadSafeFiles  = 0x2A5050,
 };
 
 constexpr EngineOffsets kOffsetsAE{
@@ -38,6 +45,8 @@ constexpr EngineOffsets kOffsetsAE{
     .getIndexForCellCoord  = 0x572BE0,
     .getOffsetData         = 0x579510,
     .getOrCreateOffsetData = 0x5795F0,
+    .getThreadSafeFile     = 0x2F91B0,
+    .clearThreadSafeFiles  = 0x2F9330,
 };
 
 constexpr EngineOffsets kOffsetsVR_1_2_72{
@@ -45,6 +54,8 @@ constexpr EngineOffsets kOffsetsVR_1_2_72{
     .getIndexForCellCoord  = 0x47B3B0,
     .getOffsetData         = 0x481330,
     .getOrCreateOffsetData = 0x4813F0,
+    .getThreadSafeFile     = 0x138EB0,
+    .clearThreadSafeFiles  = 0x139030,
 };
 
 [[nodiscard]] const EngineOffsets& PickOffsets()
@@ -66,6 +77,8 @@ using FindCellInFile_t        = bool (*)(RE::TESWorldSpace*, RE::TESFile*, std::
 using GetIndexForCellCoord_t  = std::int32_t (*)(RE::TESWorldSpace*, RE::TESFile*, std::int32_t, std::int32_t);
 using GetOffsetData_t         = OFFSET_DATA* (*)(RE::TESWorldSpace*, RE::TESFile*);
 using GetOrCreateOffsetData_t = OFFSET_DATA* (*)(RE::TESWorldSpace*, RE::TESFile*);
+using GetThreadSafeFile_t     = RE::TESFile* (*)(RE::TESFile*, std::uint32_t);
+using ClearThreadSafeFiles_t  = void (*)(RE::TESFile*);
 
 }  // namespace
 
@@ -107,6 +120,28 @@ bool RuntimeHasEngineAddresses()
 {
     const auto& o = PickOffsets();
     return o.findCellInFile != 0 && o.getIndexForCellCoord != 0 && o.getOffsetData != 0;
+}
+
+bool HasThreadSafeFilePrimitives()
+{
+    const auto& o = PickOffsets();
+    return o.getThreadSafeFile != 0 && o.clearThreadSafeFiles != 0;
+}
+
+RE::TESFile* GetThreadSafeFile(RE::TESFile* a_file, std::uint32_t a_bufSize)
+{
+    static const auto offset = PickOffsets().getThreadSafeFile;
+    if (offset == 0) return a_file;  // no clone available — caller must serialise
+    static REL::Relocation<GetThreadSafeFile_t> func{ REL::Offset(offset) };
+    return func(a_file, a_bufSize);
+}
+
+void ClearThreadSafeFiles(RE::TESFile* a_file)
+{
+    static const auto offset = PickOffsets().clearThreadSafeFiles;
+    if (offset == 0) return;
+    static REL::Relocation<ClearThreadSafeFiles_t> func{ REL::Offset(offset) };
+    func(a_file);
 }
 
 }  // namespace cog::fo4

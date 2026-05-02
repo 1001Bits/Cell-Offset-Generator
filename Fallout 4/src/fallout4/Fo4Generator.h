@@ -6,6 +6,13 @@
 
 namespace cog::fo4 {
 
+// One plugin file with its xxh3 hash precomputed in Phase 1.
+struct HashedFile
+{
+    RE::TESFile*  file;
+    std::uint64_t hash;
+};
+
 class Fo4Generator final : public cog::Generator
 {
 public:
@@ -21,6 +28,13 @@ private:
     // engine memory install + .fco persist. Returns true if pCellFileOffsets
     // was populated (either from cache or freshly generated).
     bool ProcessWorld(RE::TESFile* a_file, std::uint64_t a_fileHash, RE::TESWorldSpace* a_world);
+
+    // Worker-pool path. Each thread pulls (file, world) units off a shared
+    // counter; workers call TESFile::GetThreadSafeFile to get a per-thread
+    // clone before each ProcessWorld. Main thread joins, then clears the
+    // per-file thread→clone maps.
+    void RunParallel(std::span<const HashedFile> a_hashed,
+                     std::span<RE::TESWorldSpace* const> a_worlds);
 
     // Run FindCellInFile across the worldspace bounds, fill `a_offsets` with
     // per-cell relative offsets. Returns the count of cells found (or

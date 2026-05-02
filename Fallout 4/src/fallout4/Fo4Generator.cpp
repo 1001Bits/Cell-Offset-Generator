@@ -41,15 +41,7 @@ constexpr std::uint32_t kMaxReasonableTableSize = 4 * 1024 * 1024;
 // xxh3 hashes are pure file I/O — independent across files, no engine state.
 // We parallelise hashing because for a stable load order it dominates Run()
 // wall-time (every plugin file is read end-to-end whether or not anything
-// needs regenerating). NVSE parallelises generation too via TESFile clones
-// (`GetThreadSafeFile`); CommonLibF4 doesn't expose that, so generation
-// stays serial — see Run().
-struct HashedFile
-{
-    RE::TESFile*  file;
-    std::uint64_t hash;
-};
-
+// needs regenerating).
 [[nodiscard]] std::vector<HashedFile> HashFilesParallel(
     std::span<RE::TESFile* const> a_files)
 {
@@ -300,6 +292,101 @@ bool Fo4Generator::ProcessWorld(RE::TESFile* a_file, std::uint64_t a_fileHash,
     return RE::TESDataHandler::GetSingleton();
 }
 
+void Fo4Generator::RunParallel(std::span<const HashedFile> a_hashed,
+                                std::span<RE::TESWorldSpace* const> a_worlds)
+{
+    // Build the work list: every (file, world) pair where the file hash is OK
+    // and the world pointer is non-null. We dispatch one of these per
+    // ProcessWorld call.
+    struct Unit
+    {
+        std::size_t        fileIdx;
+        RE::TESWorldSpace* world;
+    };
+    std::vector<Unit> units;
+    units.reserve(a_hashed.size() * a_worlds.size());
+    for (std::size_t i = 0; i < a_hashed.size(); ++i) {
+        if (a_hashed[i].hash == 0) continue;
+        for (auto* world : a_worlds) {
+            if (world) units.push_back({ i, world });
+        }
+    }
+
+    if (units.empty()) {
+        for (const auto& hf : a_hashed) {
+            m_stats.processedFiles.fetch_add(1, std::memory_order_relaxed);
+            (void)hf;
+        }
+        return;
+    }
+
+    const auto hw = std::thread::hardware_concurrency();
+    const auto threadCount = std::clamp<std::size_t>(
+        hw == 0 ? 4 : hw, 1, std::min<std::size_t>(32, units.size()));
+
+    logger::info("Generator: parallel × {} thread(s) over {} (file × world) unit(s)",
+                 threadCount, units.size());
+
+    std::atomic<std::size_t> next{ 0 };
+    std::atomic<std::size_t> filesProcessed{ 0 };
+    std::vector<std::atomic<std::uint32_t>> perFileRemaining(a_hashed.size());
+    for (std::size_t i = 0; i < a_hashed.size(); ++i) {
+        perFileRemaining[i].store(0, std::memory_order_relaxed);
+    }
+    for (const auto& u : units) {
+        perFileRemaining[u.fileIdx].fetch_add(1, std::memory_order_relaxed);
+    }
+    const std::size_t totalFiles = a_hashed.size();
+
+    auto worker = [&]() {
+        try {
+            while (true) {
+                const auto idx = next.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= units.size()) return;
+                const auto& u = units[idx];
+                auto* orig = a_hashed[u.fileIdx].file;
+                auto* clone = GetThreadSafeFile(orig);
+                if (!clone) clone = orig;  // engine refused; degrade gracefully
+                ProcessWorld(clone, a_hashed[u.fileIdx].hash, u.world);
+                // Last unit for this file? Bump the per-file counter + log.
+                if (perFileRemaining[u.fileIdx].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    const auto fileNum = filesProcessed.fetch_add(1, std::memory_order_relaxed) + 1;
+                    logger::info("[{}/{}] {} done",
+                                 fileNum, totalFiles, orig->filename);
+                    m_stats.processedFiles.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        } catch (const std::exception& e) {
+            logger::error("Generator worker exception: {}", e.what());
+        } catch (...) {
+            logger::error("Generator worker: unknown exception");
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(threadCount);
+    for (std::size_t i = 0; i < threadCount; ++i) {
+        workers.emplace_back(worker);
+    }
+    for (auto& w : workers) w.join();
+
+    // Account for files that had no work (hash==0). They never decrement the
+    // per-file counter, so their processed counter never advances inside the
+    // worker. Bump processedFiles to match totalFiles for the summary line.
+    for (const auto& hf : a_hashed) {
+        if (hf.hash == 0) {
+            m_stats.processedFiles.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // Tear down all per-thread file clones. Must happen on the main thread
+    // after every worker has joined; the call walks the file's
+    // thread→clone scatter map and frees each entry.
+    for (const auto& hf : a_hashed) {
+        ClearThreadSafeFiles(hf.file);
+    }
+}
+
 void Fo4Generator::Run()
 {
     using clock = std::chrono::steady_clock;
@@ -346,33 +433,38 @@ void Fo4Generator::Run()
                  "now scanning × {} worldspace(s)",
                  hashed.size(), hashMs, worlds.size());
 
-    // Phase 2: serial generation. Engine FindCellInFile mutates
-    // TESFile::fileoffset; without per-thread file clones (NVSE's
-    // GetThreadSafeFile, not exposed by CommonLibF4) we can't safely
-    // parallelise. Inter-file parallelism is also unsafe in practice — the
-    // engine's data handler isn't documented as reentrant.
+    // Phase 2: generation. Parallel when the engine's TESFile::GetThreadSafeFile
+    // primitive is available (each worker pulls a per-thread file clone with
+    // its own BSFile cursor; GetOffsetData/FindCellInFile/etc. walk
+    // GetThreadSafeParent up to the root before keying into the worldspace
+    // map, so passing a clone returns the same OFFSET_DATA as the original).
+    // Falls back to serial when the runtime's address isn't filled in.
     const std::size_t totalFiles = hashed.size();
-    std::size_t fileIdx = 0;
-    for (const auto& hf : hashed) {
-        ++fileIdx;
-        if (hf.hash == 0) {
-            logger::warn("[{}/{}] {} — hash failed, skipping",
-                         fileIdx, totalFiles, hf.file->filename);
-            m_stats.processedFiles.fetch_add(1, std::memory_order_relaxed);
-            continue;
-        }
-
-        logger::info("[{}/{}] {} — scanning {} worldspace(s)",
-                     fileIdx, totalFiles, hf.file->filename, worlds.size());
-
-        for (auto* world : worlds) {
-            // GetFormArray<TESWorldSpace>() already returns TESWorldSpace*
-            // — no As<> cast needed.
-            if (world) {
-                ProcessWorld(hf.file, hf.hash, world);
+    if (HasThreadSafeFilePrimitives()) {
+        // RunParallel takes std::span — flatten the engine's container.
+        std::vector<RE::TESWorldSpace*> worldsVec;
+        worldsVec.reserve(worlds.size());
+        for (auto* w : worlds) worldsVec.push_back(w);
+        RunParallel(hashed, worldsVec);
+    } else {
+        logger::info("Generator: ThreadSafeFile primitives unavailable for this "
+                     "runtime — falling back to serial generation");
+        std::size_t fileIdx = 0;
+        for (const auto& hf : hashed) {
+            ++fileIdx;
+            if (hf.hash == 0) {
+                logger::warn("[{}/{}] {} — hash failed, skipping",
+                             fileIdx, totalFiles, hf.file->filename);
+                m_stats.processedFiles.fetch_add(1, std::memory_order_relaxed);
+                continue;
             }
+            logger::info("[{}/{}] {} — scanning {} worldspace(s)",
+                         fileIdx, totalFiles, hf.file->filename, worlds.size());
+            for (auto* world : worlds) {
+                if (world) ProcessWorld(hf.file, hf.hash, world);
+            }
+            m_stats.processedFiles.fetch_add(1, std::memory_order_relaxed);
         }
-        m_stats.processedFiles.fetch_add(1, std::memory_order_relaxed);
     }
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -44,4 +44,31 @@ namespace cog::fo4 {
 [[nodiscard]] OFFSET_DATA* GetOrCreateOffsetData(RE::TESWorldSpace* a_world,
                                                  RE::TESFile* a_file);
 
+// ── Thread-safe file primitives (NVSE-equivalent) ──────────────────────────
+// The engine maintains a per-file thread→clone hashmap at TESFile+0x18.
+// Each worker thread calls GetThreadSafeFile to get a clone with its own
+// BSFile cursor (TESFile::OpenTES is invoked lazily). GetOffsetData,
+// FindCellInFile, etc. all walk GetThreadSafeParent up to the master before
+// keying into the worldspace's offset map, so passing a clone returns the
+// same OFFSET_DATA as passing the original.
+//
+// Returns nullptr if the runtime's address isn't filled in
+// (HasThreadSafeFilePrimitives == false). Callers must fall back to serial.
+
+[[nodiscard]] bool HasThreadSafeFilePrimitives();
+
+// TESFile::GetThreadSafeFile
+//   OG: 0x1401322B0  |  NG: 0x1402A4ED0  |  AE: 0x1402F91B0  |  VR: 0x140138EB0
+// On worker threads, returns/creates a per-thread clone keyed by
+// GetCurrentThreadId(). On the main thread, returns a_file unchanged.
+// `a_bufSize` matches NVSE — 0x4000.
+[[nodiscard]] RE::TESFile* GetThreadSafeFile(RE::TESFile* a_file,
+                                              std::uint32_t a_bufSize = 0x4000);
+
+// TESFile::ClearThreadSafeFiles
+//   OG: 0x140132430  |  NG: 0x1402A5050  |  AE: 0x1402F9330  |  VR: 0x140139030
+// Tears down the entire thread→clone map for one file. Call once per file
+// from the main thread after all worker threads have joined.
+void ClearThreadSafeFiles(RE::TESFile* a_file);
+
 }  // namespace cog::fo4
