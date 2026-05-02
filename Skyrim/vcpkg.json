@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "cell-offset-generator-skse",
+  "version": "0.1.0",
+  "description": "Regenerates worldspace cell offset tables stripped by xEdit. Skyrim SE/AE/VR. Port of WallSoGB's Cell Offset Generator (NVSE).",
+  "dependencies": [
+    "commonlibsse-ng",
+    "spdlog",
+    "xbyak",
+    "xxhash"
+  ]
+}
