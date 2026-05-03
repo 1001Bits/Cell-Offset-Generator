@@ -92,10 +92,25 @@ std::uint32_t* Fo4Generator::InstallEngineArray(std::span<const std::uint32_t> a
     // Falling back to plain operator new would leak on game shutdown but
     // wouldn't corrupt anything; using the engine allocator keeps ownership
     // semantics aligned with how the OFST-load path normally fills this field.
-    auto* buf = static_cast<std::uint32_t*>(RE::malloc(byteSize));
-    if (!buf) {
+    //
+    // Bethesda's MemoryManager (and its ScrapHeap scratch component) is NOT
+    // safe for concurrent allocation. Worker-parallel RE::malloc from this
+    // path crashed a tester (Buffout dump showed AV inside the allocator,
+    // RAX = ScrapHeap*, RBX = corrupted free-list pointer) on a 328-plugin
+    // PRP load order. Buffout4 ships its own replacement MemoryManager and
+    // SmallBlockAllocator that don't have this race, but they're opt-in and
+    // most users don't enable them. Serialize allocations here so we're
+    // correct on stock heaps too.
+    static std::mutex sAllocMutex;
+    void* raw = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(sAllocMutex);
+        raw = RE::malloc(byteSize);
+    }
+    if (!raw) {
         return nullptr;
     }
+    auto* buf = static_cast<std::uint32_t*>(raw);
     std::memcpy(buf, a_offsets.data(), byteSize);
     return buf;
 }
@@ -338,28 +353,47 @@ void Fo4Generator::RunParallel(std::span<const HashedFile> a_hashed,
     }
     const std::size_t totalFiles = a_hashed.size();
 
+    // The engine's per-thread file hashmap (TESFile+0x18) is populated lazily
+    // on first GetThreadSafeFile call. Concurrent first-use inserts on the
+    // same file race on hashmap mutation — Bethesda's own pre-warm path
+    // (TESDataHandler::CreateThreadSafeFiles) calls it serially before
+    // dispatching workers. We don't expose CreateThreadSafeFiles, so serialize
+    // GetThreadSafeFile here. Hashmap reads after first-insert are cheap; the
+    // mutex only contends for a moment per (worker, file) pair.
+    std::mutex tsfMutex;
+
+    auto markFileDoneIfLast = [&](std::size_t fileIdx, const RE::TESFile* orig) {
+        if (perFileRemaining[fileIdx].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            const auto fileNum = filesProcessed.fetch_add(1, std::memory_order_relaxed) + 1;
+            logger::info("[{}/{}] {} done", fileNum, totalFiles, orig->filename);
+            m_stats.processedFiles.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
     auto worker = [&]() {
-        try {
-            while (true) {
-                const auto idx = next.fetch_add(1, std::memory_order_relaxed);
-                if (idx >= units.size()) return;
-                const auto& u = units[idx];
-                auto* orig = a_hashed[u.fileIdx].file;
-                auto* clone = GetThreadSafeFile(orig);
+        while (true) {
+            const auto idx = next.fetch_add(1, std::memory_order_relaxed);
+            if (idx >= units.size()) return;
+            const auto& u = units[idx];
+            auto* orig = a_hashed[u.fileIdx].file;
+            const char* worldName = u.world ? u.world->GetFormEditorID() : "?";
+            try {
+                RE::TESFile* clone = nullptr;
+                {
+                    std::lock_guard<std::mutex> lk(tsfMutex);
+                    clone = GetThreadSafeFile(orig);
+                }
                 if (!clone) clone = orig;  // engine refused; degrade gracefully
                 ProcessWorld(clone, a_hashed[u.fileIdx].hash, u.world);
-                // Last unit for this file? Bump the per-file counter + log.
-                if (perFileRemaining[u.fileIdx].fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    const auto fileNum = filesProcessed.fetch_add(1, std::memory_order_relaxed) + 1;
-                    logger::info("[{}/{}] {} done",
-                                 fileNum, totalFiles, orig->filename);
-                    m_stats.processedFiles.fetch_add(1, std::memory_order_relaxed);
-                }
+            } catch (const std::exception& e) {
+                logger::error("[{}/{}] worker exception: {}",
+                              orig->filename, worldName, e.what());
+            } catch (...) {
+                logger::error("[{}/{}] worker: unknown exception (likely SEH AV)",
+                              orig->filename, worldName);
             }
-        } catch (const std::exception& e) {
-            logger::error("Generator worker exception: {}", e.what());
-        } catch (...) {
-            logger::error("Generator worker: unknown exception");
+            // Decrement even on exception so the file still reaches "done".
+            markFileDoneIfLast(u.fileIdx, orig);
         }
     };
 
