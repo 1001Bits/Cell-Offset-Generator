@@ -29,6 +29,10 @@ public:
         // it on a prior run).
         std::atomic<std::uint32_t> cacheHits{ 0 };
         std::atomic<std::uint32_t> emptyWorlds{ 0 };
+        // Worldspace had no cells but valid bounds; we installed a zero-valued
+        // pCellFileOffsets so the engine's editor-ID lookup path doesn't crash
+        // on null-deref. Subset of emptyWorlds.
+        std::atomic<std::uint32_t> emptySentinels{ 0 };
     };
 
     // Run the generation pass synchronously. Spawns its own thread pool.

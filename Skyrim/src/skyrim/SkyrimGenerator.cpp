@@ -44,6 +44,35 @@ constexpr std::uint32_t kMaxReasonableTableSize = 4 * 1024 * 1024;
                   / (std::string(a_world->GetFormEditorID()) + ".fco");
 }
 
+// Mirrors Generate()'s bounds-validation. Returns the offsetCount the engine
+// would index against, or 0 when bounds are invalid (no-cells sentinel,
+// inverted/oversized ranges, or GetIndexForCellCoord rejecting the corner).
+// Used to size the empty-world sentinel array installed below.
+[[nodiscard]] std::uint32_t ComputeOffsetCount(
+    RE::TESWorldSpace* a_world, RE::TESFile* a_file, const OFFSET_DATA* a_data)
+{
+    const auto minX = WorldUnitsToCell(a_data->offsetMinCoords.x);
+    const auto minY = WorldUnitsToCell(a_data->offsetMinCoords.y);
+    const auto maxX = WorldUnitsToCell(a_data->offsetMaxCoords.x);
+    const auto maxY = WorldUnitsToCell(a_data->offsetMaxCoords.y);
+    if (minX == -524288) {
+        return 0;
+    }
+    if (maxX < minX || maxY < minY ||
+        (maxX - minX + 1) >= 1000 || (maxY - minY + 1) >= 1000) {
+        return 0;
+    }
+    const auto maxIdx = GetIndexForCellCoord(a_world, a_file, maxX, maxY);
+    if (maxIdx <= 0) {
+        return 0;
+    }
+    const auto offsetCount = static_cast<std::uint32_t>(maxIdx);
+    if (offsetCount > kMaxReasonableTableSize) {
+        return 0;
+    }
+    return offsetCount;
+}
+
 }  // namespace
 
 std::filesystem::path SkyrimGenerator::GetCacheRoot() const
@@ -271,9 +300,24 @@ bool SkyrimGenerator::ProcessWorld(RE::TESFile* a_file, std::uint64_t a_fileHash
                      a_file->fileName, a_world->GetFormEditorID());
         break;
     }
-    case CacheFile::LoadStatus::kEmptyWorld:
+    case CacheFile::LoadStatus::kEmptyWorld: {
+        // Cached as empty, but our Load NOPs created OFFSET_DATA for this ESP
+        // → pCellFileOffsets is null. The engine's editor-ID lookup path
+        // (FUN_140306dc0 in AE, called from `coc <editorID>`) dereferences
+        // pCellFileOffsets without a nullcheck, so install a zero-valued
+        // sentinel sized to offsetCount. Reads return 0 = "no cell here",
+        // which is the correct semantics for an empty worldspace.
+        const auto offsetCount = ComputeOffsetCount(a_world, a_file, data);
+        if (offsetCount > 0) {
+            std::vector<std::uint32_t> zeros(offsetCount, 0);
+            if (auto* buf = InstallEngineArray(zeros)) {
+                data->pCellFileOffsets = buf;
+                m_stats.emptySentinels.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         m_stats.emptyWorlds.fetch_add(1, std::memory_order_relaxed);
         return false;
+    }
     default:
         // Cache miss / mismatch / corrupt — regenerate.
         break;
@@ -281,11 +325,20 @@ bool SkyrimGenerator::ProcessWorld(RE::TESFile* a_file, std::uint64_t a_fileHash
 
     const auto cellsFound = Generate(a_file, a_world, data, offsets);
     if (cellsFound == UINT32_MAX) {
+        // Bounds invalid — engine's GetIndexForCellCoord will reject all
+        // (x, y) here too, so the unsafe deref site can never fire. No
+        // sentinel needed.
         return false;
     }
     if (cellsFound == 0) {
         // Worldspace exists in this plugin but contributes no exterior cells.
-        // Persist a sentinel so we can short-circuit next launch.
+        // Install a zero-valued sentinel — same reason as the kEmptyWorld
+        // branch above. The offsets vector was already sized to offsetCount
+        // and zero-initialized at the start of Generate.
+        if (auto* buf = InstallEngineArray(offsets)) {
+            data->pCellFileOffsets = buf;
+            m_stats.emptySentinels.fetch_add(1, std::memory_order_relaxed);
+        }
         std::ignore = CacheFile::Save(cachePath, a_fileHash, {});
         m_stats.emptyWorlds.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -373,13 +426,14 @@ void SkyrimGenerator::Run()
 
     logger::info(
         "Generator: done in {} ms — files={}, generated={}, cache-hits={}, "
-        "OFST-intact={}, empty-worlds={}",
+        "OFST-intact={}, empty-worlds={} (sentinels={})",
         elapsed,
         m_stats.processedFiles.load(),
         m_stats.generatedTables.load(),
         m_stats.cacheHits.load(),
         m_stats.ofstIntact.load(),
-        m_stats.emptyWorlds.load());
+        m_stats.emptyWorlds.load(),
+        m_stats.emptySentinels.load());
 }
 
 }  // namespace cog::sky

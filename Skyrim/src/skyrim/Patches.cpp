@@ -22,17 +22,24 @@ struct PatchSite
     std::uint8_t   expected[6];  // verification bytes (unused tail = 0)
 };
 
-// AE 1.6.1170 — verified working. See docs/skyrim-engine-map.md.
+// Patch sites cover EXTERIOR cell paths only. The original NVSE Cell-Offset-
+// Generator deliberately leaves ESP interior cells on the vanilla path (per
+// the InteriorOffsets.hpp comment: "ESP makes cell contents always loaded …
+// only master files have offsets"). Earlier versions of this port NOPed two
+// extra interior gates (Load.interiorFileOffset, CELL.FindInFileFast) and
+// eagerly wrote INTERIOR_DATA+0x5C; that caused interior→exterior CTDs that
+// baked into save state. Reverting to vanilla interior behavior matches the
+// original NVSE design.
+
+// AE 1.6.1170 — verified working.
 constexpr PatchSite kPatchSitesAE_1_6_1170[] = {
     { 0x1403053F2, 2, "Load.fileOffset",            Group::Load,   { 0x74, 0x15 } },
     { 0x140305566, 6, "Load.offsetMinCoords",       Group::Load,   { 0x0F, 0x84, 0x91, 0x05, 0x00, 0x00 } },
     { 0x1403056DF, 6, "Load.offsetMaxCoords",       Group::Load,   { 0x0F, 0x84, 0x18, 0x04, 0x00, 0x00 } },
     { 0x140305F6E, 6, "LoadPartial.gate1",          Group::Load,   { 0x0F, 0x84, 0x99, 0x00, 0x00, 0x00 } },
     { 0x140305FF5, 2, "LoadPartial.gate2",          Group::Load,   { 0x74, 0x16 } },
-    { 0x1402B26BE, 2, "Load.interiorFileOffset",    Group::Load,   { 0x74, 0x07 } },
     { 0x1403069EC, 2, "FindInFileFast",             Group::Lookup, { 0x74, 0x48 } },
     { 0x1403064E6, 2, "FindCellInFile",             Group::Lookup, { 0x74, 0x63 } },
-    { 0x1402BF463, 6, "CELL.FindInFileFast",        Group::Lookup, { 0x0F, 0x84, 0xB4, 0x00, 0x00, 0x00 } },
 };
 
 // SE 1.5.97 — verified via Ghidra (SkyrimSE.gpr).
@@ -42,10 +49,8 @@ constexpr PatchSite kPatchSitesSE_1_5_97[] = {
     { 0x1402B0E5D, 6, "Load.offsetMaxCoords",       Group::Load,   { 0x0F, 0x84, 0x6E, 0x06, 0x00, 0x00 } },
     { 0x1402B165E, 6, "LoadPartial.gate1",          Group::Load,   { 0x0F, 0x84, 0xA9, 0x00, 0x00, 0x00 } },
     { 0x1402B16F5, 2, "LoadPartial.gate2",          Group::Load,   { 0x74, 0x16 } },
-    { 0x14025F83A, 2, "Load.interiorFileOffset",    Group::Load,   { 0x74, 0x07 } },
     { 0x1402B207C, 2, "FindInFileFast",             Group::Lookup, { 0x74, 0x48 } },
     { 0x1402B1B86, 2, "FindCellInFile",             Group::Lookup, { 0x74, 0x63 } },
-    { 0x14026A7AF, 2, "CELL.FindInFileFast",        Group::Lookup, { 0x74, 0x72 } },
 };
 
 // VR 1.4.15 — verified via Ghidra (skyrimvr.gpr). Function bodies are byte-
@@ -56,10 +61,8 @@ constexpr PatchSite kPatchSitesVR_1_4_15[] = {
     { 0x1402C25CD, 6, "Load.offsetMaxCoords",       Group::Load,   { 0x0F, 0x84, 0x6E, 0x06, 0x00, 0x00 } },
     { 0x1402C2DCE, 6, "LoadPartial.gate1",          Group::Load,   { 0x0F, 0x84, 0xA9, 0x00, 0x00, 0x00 } },
     { 0x1402C2E65, 2, "LoadPartial.gate2",          Group::Load,   { 0x74, 0x16 } },
-    { 0x140270CEA, 2, "Load.interiorFileOffset",    Group::Load,   { 0x74, 0x07 } },
     { 0x1402C37EC, 2, "FindInFileFast",             Group::Lookup, { 0x74, 0x48 } },
     { 0x1402C32F6, 2, "FindCellInFile",             Group::Lookup, { 0x74, 0x63 } },
-    { 0x14027BD7F, 2, "CELL.FindInFileFast",        Group::Lookup, { 0x74, 0x72 } },
 };
 
 [[nodiscard]] std::span<const PatchSite> PickPatchSites()

@@ -6,7 +6,6 @@
 #include "skyrim/FindCellInFileTimer.h"
 #include "skyrim/GetExtCellDataTest.h"
 #include "skyrim/InteriorHooks.h"
-#include "skyrim/InteriorValidator.h"
 #include "skyrim/Patches.h"
 #include "skyrim/PhaseTimer.h"
 #include "skyrim/SkyrimGenerator.h"
@@ -74,7 +73,6 @@ namespace
             }
             if (g_settings.runValidator) {
                 cog::sky::RunValidator();
-                cog::sky::RunInteriorValidator();
                 cog::sky::RunGetExtCellDataTest();
             }
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(

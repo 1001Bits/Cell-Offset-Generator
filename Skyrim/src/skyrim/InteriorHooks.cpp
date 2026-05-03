@@ -9,23 +9,27 @@ namespace cog::sky {
 namespace {
 
 // =============================================================================
-// Strategy
+// Strategy — master-only interior offset repair
 // =============================================================================
 //
-// The Load.interiorFileOffset NOP (in Patches.cpp) lets ESP cells flow through
-// the engine's own SetInteriorOffset CALL inside TESObjectCELL::Load — but
-// only when the DATA opcode handler runs. Override-only ESP records (changing
-// FULL/LCTN without redefining DATA) skip that path entirely, so the master's
-// previously-written +0x5C gets clobbered when cellData.interior is
-// reallocated, and FindInFileFast falls back to slow scan.
+// Mirrors WallSoGB's NVSE Cell-Offset-Generator design (InteriorOffsets.hpp):
+// "ESP makes cell contents always loaded ... only master files have offsets."
+// We capture and repair offsets ONLY for cells whose primary file is a master
+// (.esm, .esl, ESM-flagged ESP). ESP interior cells are left on the vanilla
+// path entirely — never touched, never written, never read.
 //
-// To close that gap we hook TESObjectCELL::Load at the function entry. Every
-// cell load — master, ESP-with-DATA, override-only — captures
-// (file, formID, file->fileOffset) into our interior map. Then in the
-// post-kDataLoaded scrape we run a repair pass: any cell still showing
-// +0x5C == 0 gets the captured offset written back into INTERIOR_DATA.
+// Earlier versions of this code applied the optimization to all plugins and
+// caused interior→exterior CTDs that baked into save state. Restricting to
+// masters matches the original NVSE author's explicit IsMaster check and
+// closes the failure mode.
 //
-// All offsets are validated by InteriorValidator against the source plugins.
+// Why we still need this for masters: xEdit doesn't preserve OFST records on
+// save, so any master cleaned via QAC, ESM-flagged ESP saved through xEdit,
+// or plugin processed by Persistentify ships with INTERIOR_DATA+0x5C
+// uninitialized. Engine writes 0 to the field, FindInFileFast finds 0 and
+// falls through to the slow path. We capture the file offset at Load time
+// (when the engine has the right value in file->fileOffset) and write it
+// back into INTERIOR_DATA+0x5C in the post-kDataLoaded scrape.
 
 // Hook strategy: vtable swap on TESObjectCELL slot 6 (Load). Safer than a
 // 5-byte function-entry splice — it doesn't require knowing the runtime's
@@ -101,10 +105,11 @@ LoadFn g_origLoad = nullptr;
 
 bool __fastcall LoadHook(RE::TESObjectCELL* a_cell, RE::TESFile* a_file)
 {
-    // Capture (file, formID, fileOffset) on EVERY cell-load entry — covers
-    // override-only records that never reach the engine's own SetInteriorOffset
-    // CALL. fileOffset is the cell record's start offset in the source file.
-    if (a_cell && a_file) {
+    // Master-only capture, mirrors NVSE InteriorOffsets.hpp's IsMaster guard.
+    // ESP interior cells stay on the vanilla code path (never reach our map,
+    // never get +0x5C touched).
+    if (a_cell && a_file &&
+        a_file->recordFlags.all(RE::TESFile::RecordFlag::kMaster)) {
         const auto offset = ReadFileOffset(a_file);
         if (offset != 0) {
             const auto formID = a_cell->GetFormID() & 0x00FFFFFFu;
@@ -169,6 +174,12 @@ void ScrapeInteriorCellsFromLoadedForms()
             continue;
         }
 
+        // Master-only repair, matching the LoadHook filter above. ESP-defined
+        // interior cells are left on the vanilla path.
+        if (!file->recordFlags.all(RE::TESFile::RecordFlag::kMaster)) {
+            continue;
+        }
+
         const auto read = ReadCellOffsetField(cell);
         if (!read.cellDataPresent) {
             ++skippedNullCellData;
@@ -186,14 +197,19 @@ void ScrapeInteriorCellsFromLoadedForms()
             continue;
         }
 
-        // Repair: cell has cellData but +0x5C == 0. Walk the cell's
-        // sourceFiles array directly — TESForm::GetFile(i) for out-of-range
-        // i returns array->back() rather than nullptr, so a `until null`
-        // loop never terminates.
+        // Repair: cell has cellData but +0x5C == 0 (typical xEdit-cleaned
+        // master). Walk the cell's sourceFiles array — TESForm::GetFile(i)
+        // for out-of-range i returns array->back() rather than nullptr, so a
+        // `until null` loop never terminates.
         //
         // Prefer the LATEST file's offset (overrides sit later in the list)
         // since cellData itself was last reallocated by that file's load,
         // making its offset most likely the one FindInFileFast will need.
+        // Multi-source masters are the normal state in real modlists (USSEP,
+        // cleaning tools, Persistentify all touch cells); filtering them out
+        // disables the optimization entirely. The hot lookup path queries
+        // the latest override file, so writing the latest's offset matches
+        // vanilla engine behavior.
         ++repairTried;
         std::uint32_t patched = 0;
         if (auto* arr = cell->sourceFiles.array) {
