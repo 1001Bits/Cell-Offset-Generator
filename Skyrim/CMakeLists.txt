@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.23)
 
 set(NAME "FasterCellLookup")
-set(VERSION 1.1.0)
+set(VERSION 1.3.0)
 
 message(">>> Start build for '${NAME}' v${VERSION}")
 
@@ -37,9 +37,13 @@ add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_DEBUG OFF)
 
-# ── CommonLibSSE-NG (multi-runtime: SE 1.5.97, AE 1.6.1170, VR) ────────────
-# Provided via vcpkg — supports runtime detection for SE/AE/VR
-find_package(CommonLibSSE CONFIG REQUIRED)
+# ── CommonLibSSE-NG (alandtse/CommonLibVR ng branch, source build) ──────────
+# Pulled in as a git checkout under extern/CommonLibVR. This is the actively
+# maintained NG fork that tracks po3 upstream patches — distinct from the
+# colorglass vcpkg port (CharmedBaryon/CommonLibSSE-NG, last updated 2023).
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(SKSE_SUPPORT_XBYAK ON CACHE BOOL "" FORCE)
+add_subdirectory(extern/CommonLibVR)
 
 # ── Additional dependencies ─────────────────────────────────────────────────
 find_package(spdlog REQUIRED CONFIG)
@@ -54,10 +58,7 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
 # Multi-runtime build: SE 1.5.97, AE 1.6.1170, VR 1.4.15. Patch sites and
 # engine-function addresses are picked at runtime in src/skyrim/. Runtimes
 # without filled-in address tables silently skip patching with a log entry.
-add_commonlibsse_plugin(${PROJECT_NAME}
-    SOURCES ${SOURCES}
-    AUTHOR "noud"
-)
+add_library(${PROJECT_NAME} SHARED ${SOURCES})
 
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23)
 target_precompile_headers(${PROJECT_NAME} PRIVATE "${SOURCE_DIR}/PCH.h")
@@ -67,6 +68,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
+    CommonLibSSE::CommonLibSSE
     spdlog::spdlog
     xxHash::xxhash
 )
@@ -94,5 +96,16 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio")
         /OPT:ICF
     )
 endif()
+
+# ── SKSE plugin metadata generator ───────────────────────────────────────────
+# The colorglass port shipped an `add_commonlibsse_plugin` macro that wrote
+# out the PluginDeclaration boilerplate. With the source build we synthesize
+# the same file ourselves so SKSE recognises the DLL as a plugin.
+configure_file(
+    "${ROOT_DIR}/cmake/plugin.cpp.in"
+    "${BUILD_DIR}/plugin.cpp"
+    @ONLY
+)
+target_sources(${PROJECT_NAME} PRIVATE "${BUILD_DIR}/plugin.cpp")
 
 message(">>> ${PROJECT_NAME} configured successfully")

@@ -1,0 +1,15 @@
+// Auto-generated SKSE plugin declaration. Mirrors the file the colorglass
+// vcpkg port's `add_commonlibsse_plugin` macro used to emit. Configured by
+// CMakeLists.txt at generate-time from PROJECT_NAME / PROJECT_VERSION.
+#include "REL/Relocation.h"
+#include "SKSE/SKSE.h"
+
+SKSEPluginInfo(
+    .Version = REL::Version{ @PROJECT_VERSION_MAJOR@, @PROJECT_VERSION_MINOR@, @PROJECT_VERSION_PATCH@, 0 },
+    .Name = "@PROJECT_NAME@"sv,
+    .Author = "noud"sv,
+    .SupportEmail = ""sv,
+    .StructCompatibility = SKSE::StructCompatibility::Independent,
+    .RuntimeCompatibility = SKSE::VersionIndependence::AddressLibrary,
+    .MinimumSKSEVersion = REL::Version{ 0, 0, 0, 0 }
+)
