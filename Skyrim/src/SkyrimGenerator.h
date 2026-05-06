@@ -1,20 +1,21 @@
 #pragma once
 
+#include "PCH.h"
+#include "EngineTypes.h"
+
 #include <atomic>
-#include <cstdint>
-#include <filesystem>
 
 namespace cog {
 
-// Engine-agnostic offset generator orchestration. The actual per-plugin
-// scanning logic that knows how to read TES4 plugin files lives in the
-// engine-specific layer (skyrim/, fnv/, fo4/...).
-class Generator
+// Drives the cell-offset regeneration pass: per (file × worldspace) it tries
+// the .fco cache first, then runs FindCellInFile across the worldspace bounds
+// to fill `pCellFileOffsets` and persist the result. Owns its own thread pool;
+// `Run()` blocks until all files are processed.
+class SkyrimGenerator
 {
 public:
-    virtual ~Generator() = default;
+    SkyrimGenerator() = default;
 
-    // Folder for cache files (relative to the game's Data directory).
     static constexpr const char* kCacheDirName = "CellOffsets";
 
     struct Stats
@@ -35,16 +36,19 @@ public:
         std::atomic<std::uint32_t> emptySentinels{ 0 };
     };
 
-    // Run the generation pass synchronously. Spawns its own thread pool.
-    // Returns when all files are processed and offsets are applied.
-    virtual void Run() = 0;
+    void Run();
 
     [[nodiscard]] const Stats& GetStats() const noexcept { return m_stats; }
+    [[nodiscard]] std::filesystem::path GetCacheRoot() const;
 
-    // Where the cache lives — typically <DataDir>/CellOffsets/.
-    [[nodiscard]] virtual std::filesystem::path GetCacheRoot() const = 0;
+private:
+    bool ProcessWorld(RE::TESFile* a_file, std::uint64_t a_fileHash, RE::TESWorldSpace* a_world);
 
-protected:
+    std::uint32_t Generate(RE::TESFile* a_file, RE::TESWorldSpace* a_world,
+                           OFFSET_DATA* a_data, std::vector<std::uint32_t>& a_offsets);
+
+    [[nodiscard]] std::uint32_t* InstallEngineArray(std::span<const std::uint32_t> a_offsets);
+
     Stats m_stats{};
 };
 

@@ -1,25 +1,29 @@
 #include "PCH.h"
-#include "skyrim/EngineCalls.h"
+#include "EngineCalls.h"
 
-namespace cog::sky {
+namespace cog {
 
 namespace {
 
 // Engine-function lookups. SE+AE resolve via Address Library IDs (resilient
 // to minor patch revisions). VR's sparse CSV (~13.8k of ~778k entries)
 // doesn't include 2 of our 4 IDs, so VR keeps an image-relative fallback.
+// GOG 1.6.1179 may have no Address Library versionlib bin available, so it
+// also uses image-relative offsets (verified via Ghidra against the GOG
+// SkyrimSE.exe — see ../../docs/skyrim-engine-map.md and Patches.cpp).
 struct EngineFunc
 {
     std::uint64_t  seID;
     std::uint64_t  aeID;
-    std::uintptr_t vrOffset;  // image-relative; 0 disables on VR
+    std::uintptr_t vrOffset;   // image-relative; 0 disables on VR
+    std::uintptr_t gogOffset;  // image-relative; 0 disables on GOG 1.6.1179
 };
 
 // IDs verified against versionlib-1-6-1170-0.bin (AE) and version-1-5-97-0.bin
-// (SE); VR offsets verified via Ghidra (skyrimvr.gpr).
-constexpr EngineFunc kFindCellInFile       { 20022, 20456, 0x2C32D0 };
-constexpr EngineFunc kGetIndexForCellCoord { 20023, 20457, 0x2C3560 };
-constexpr EngineFunc kGetOrCreateOffsetData{ 20110, 20560, 0x2C9210 };
+// (SE); VR + GOG offsets verified via Ghidra.
+constexpr EngineFunc kFindCellInFile       { 20022, 20456, 0x2C32D0, 0x3062F0 };
+constexpr EngineFunc kGetIndexForCellCoord { 20023, 20457, 0x2C3560, 0x306580 };
+constexpr EngineFunc kGetOrCreateOffsetData{ 20110, 20560, 0x2C9210, 0x30C8B0 };
 
 [[nodiscard]] std::uintptr_t Resolve(const EngineFunc& a_func)
 {
@@ -27,6 +31,11 @@ constexpr EngineFunc kGetOrCreateOffsetData{ 20110, 20560, 0x2C9210 };
         return a_func.vrOffset == 0
                  ? 0
                  : REL::Offset(a_func.vrOffset).address();
+    }
+    if (IsGOG()) {
+        return a_func.gogOffset == 0
+                 ? 0
+                 : REL::Offset(a_func.gogOffset).address();
     }
     return REL::RelocationID(a_func.seID, a_func.aeID).address();
 }
@@ -71,4 +80,4 @@ bool RuntimeHasEngineAddresses()
     return Resolve(kFindCellInFile) != 0 && Resolve(kGetIndexForCellCoord) != 0;
 }
 
-}  // namespace cog::sky
+}  // namespace cog

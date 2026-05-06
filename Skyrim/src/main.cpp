@@ -1,15 +1,14 @@
 #include "PCH.h"
 
-#include "cog/Settings.h"
-#include "skyrim/Benchmark.h"
-#include "skyrim/EngineCalls.h"
-#include "skyrim/FindCellInFileTimer.h"
-#include "skyrim/GetExtCellDataTest.h"
-#include "skyrim/InteriorHooks.h"
-#include "skyrim/Patches.h"
-#include "skyrim/PhaseTimer.h"
-#include "skyrim/SkyrimGenerator.h"
-#include "skyrim/Validator.h"
+#include "CellFindInFileFastTimer.h"
+#include "CellLoadTimer.h"
+#include "EngineCalls.h"
+#include "EngineTypes.h"
+#include "FindCellInFileTimer.h"
+#include "Patches.h"
+#include "PhaseTimer.h"
+#include "Settings.h"
+#include "SkyrimGenerator.h"
 
 #include <ShlObj.h>
 
@@ -20,8 +19,10 @@ namespace
     // SKSE::log::log_directory() reads the game-folder name from Skyrim.INI,
     // which on this user's setup resolves to "Skyrim.INI" itself instead of
     // "Skyrim Special Edition". Construct the SKSE log path explicitly to
-    // avoid that lookup entirely. VR uses a different game-folder name; we
-    // detect via REL::Module so this must be called *after* SKSE::Init.
+    // avoid that lookup entirely. The folder name varies by runtime — VR
+    // uses "Skyrim VR", GOG uses "Skyrim Special Edition GOG", everything
+    // else (SE / Steam AE) uses "Skyrim Special Edition". We must call this
+    // *after* SKSE::Init so REL::Module::version() is populated.
     [[nodiscard]] std::filesystem::path ResolveSkseDir()
     {
         PWSTR docs = nullptr;
@@ -31,7 +32,13 @@ namespace
         std::filesystem::path path = docs;
         CoTaskMemFree(docs);
         path /= L"My Games";
-        path /= REL::Module::IsVR() ? L"Skyrim VR" : L"Skyrim Special Edition";
+        if (REL::Module::IsVR()) {
+            path /= L"Skyrim VR";
+        } else if (cog::IsGOG()) {
+            path /= L"Skyrim Special Edition GOG";
+        } else {
+            path /= L"Skyrim Special Edition";
+        }
         path /= L"SKSE";
         std::error_code ec;
         std::filesystem::create_directories(path, ec);
@@ -52,45 +59,53 @@ namespace
         spdlog::set_pattern("[%Y-%m-%d %T.%e] [%l] %v");
     }
 
+    void RunPostDataLoadedWork()
+    {
+        if (!cog::RuntimeHasEngineAddresses()) {
+            logger::info("Generator: skipping — no engine addresses for this runtime");
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        if (g_settings.enablePatches) {
+            cog::SkyrimGenerator generator;
+            generator.Run();
+        } else {
+            logger::info("post-kDataLoaded: skipped (EnablePatches=0)");
+        }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        logger::info("Phase: post-kDataLoaded work took {} ms", ms);
+
+        // Reset measurement counters so the first transition's stats aren't
+        // polluted by data-load-time activity (generator's slow-path probes
+        // populating tables). The optimization is about runtime lookups.
+        const auto pre = cog::SnapshotAndResetFindCell();
+        (void)cog::SnapshotAndResetPerCell();
+        (void)cog::SnapshotAndResetCellFind();
+        (void)cog::SnapshotAndResetCellLoad();
+        if (pre.calls > 0) {
+            const auto totalUs = pre.totalNs / 1000ull;
+            const auto slowTotalUs = pre.slowTotalNs / 1000ull;
+            logger::info("FindCellInFile [data-load]: calls={}, total={}us, "
+                         "fast={}, slow={} (slow total={}us) "
+                         "(reset for runtime measurement)",
+                         pre.calls, totalUs, pre.fastCalls, pre.slowCalls,
+                         slowTotalUs);
+        }
+    }
+
     void MessageHandler(SKSE::MessagingInterface::Message* a_message)
     {
-        cog::sky::PhaseTimer::OnMessage(a_message);
-        if (a_message && a_message->type == SKSE::MessagingInterface::kDataLoaded) {
-            if (!cog::sky::RuntimeHasEngineAddresses()) {
-                logger::info("Generator: skipping — no engine addresses for this runtime");
-                return;
+        try {
+            cog::PhaseTimer::OnMessage(a_message);
+            if (a_message && a_message->type == SKSE::MessagingInterface::kDataLoaded) {
+                RunPostDataLoadedWork();
             }
-            const auto t0 = std::chrono::steady_clock::now();
-            if (g_settings.enablePatches) {
-                {
-                    cog::sky::SkyrimGenerator generator;
-                    generator.Run();
-                }
-                cog::sky::RunFindCellBenchmark(g_settings);
-                cog::sky::ScrapeInteriorCellsFromLoadedForms();
-            } else {
-                logger::info("post-kDataLoaded: skipped (EnablePatches=0)");
-            }
-            if (g_settings.runValidator) {
-                cog::sky::RunValidator();
-                cog::sky::RunGetExtCellDataTest();
-            }
-            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now() - t0)
-                                .count();
-            logger::info("Phase: post-kDataLoaded work took {} ms", ms);
-
-            // Reset FindCellInFile counters so the first transition's stats
-            // aren't polluted by data-load-time activity (generator probes,
-            // benchmark calls, etc.). The optimization is about runtime
-            // lookups, not data-load lookups.
-            const auto pre = cog::sky::SnapshotAndResetFindCell();
-            if (pre.calls > 0) {
-                const auto totalUs = pre.totalNs / 1000ull;
-                logger::info("FindCellInFile [data-load]: calls={}, total={}us "
-                             "(reset for runtime measurement)",
-                             pre.calls, totalUs);
-            }
+        } catch (const std::exception& e) {
+            logger::error("MessageHandler: unhandled exception — {}", e.what());
+        } catch (...) {
+            logger::error("MessageHandler: unknown unhandled exception");
         }
     }
 }
@@ -99,7 +114,7 @@ namespace
 // them in SKSEPluginLoad (which runs at SKSE init, before kDataLoaded).
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
-    cog::sky::PhaseTimer::MarkPluginLoadStart();
+    cog::PhaseTimer::MarkPluginLoadStart();
 
     // Must initialize SKSE first — InitializeLog() reads REL::Module::IsVR()
     // to pick the right Documents folder ("Skyrim VR" vs "Skyrim Special Edition").
@@ -116,9 +131,9 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
     const auto iniPath = std::filesystem::path("Data/SKSE/Plugins") /
                          fmt::format("{}.ini", plugin->GetName());
     g_settings = cog::Settings::Load(iniPath);
-    logger::info("Settings: load-gates={}, lookup-gates={}, benchmark={}",
-                 g_settings.enableLoadGates, g_settings.enableLookupGates,
-                 g_settings.runBenchmark);
+    cog::PhaseTimer::SetVerboseCellLogging(g_settings.findCellInFileLogging);
+    logger::info("Settings: enable-patches={}, find-cell-logging={}",
+                 g_settings.enablePatches, g_settings.findCellInFileLogging);
 
     const auto messaging = SKSE::GetMessagingInterface();
     if (!messaging || !messaging->RegisterListener(MessageHandler)) {
@@ -128,19 +143,14 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 
     SKSE::AllocTrampoline(1 << 10);
 
-    if (!cog::sky::InstallEsmGateNops(g_settings)) {
+    if (!cog::Patches::InitHooks(g_settings)) {
         logger::warn("Patches not fully applied — see log for details");
     }
-    if (g_settings.enablePatches) {
-        if (!cog::sky::InstallInteriorHooks(g_settings)) {
-            logger::warn("Interior hooks not installed — see log for details");
-        }
-    } else {
-        logger::info("InteriorHooks: skipped (EnablePatches=0)");
+    if (cog::RuntimeHasEngineAddresses()) {
+        (void)cog::FindCellInFileTimer::InitHooks();
     }
-    if (cog::sky::RuntimeHasEngineAddresses()) {
-        cog::sky::InstallFindCellInFileTimer();
-    }
+    (void)cog::CellFindInFileFastTimer::InitHooks();
+    (void)cog::CellLoadTimer::InitHooks();
 
     logger::info("{} loaded", plugin->GetName());
     return true;

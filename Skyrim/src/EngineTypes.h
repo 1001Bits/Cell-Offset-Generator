@@ -2,7 +2,18 @@
 
 #include "PCH.h"
 
-namespace cog::sky {
+namespace cog {
+
+// Skyrim SE GOG (build 1.6.1179) is one revision past Steam AE 1.6.1170 with
+// the GOG Galaxy SDK linked in. Address Library v2 may not have a versionlib
+// bin for it, so any RE::ID / RelocationID lookup throws. Code that needs to
+// resolve engine entry points must branch on IsGOG() and use raw image-
+// relative offsets baked from a Ghidra dump of the GOG binary.
+[[nodiscard]] inline bool IsGOG() noexcept
+{
+    constexpr REL::Version kGOG{ 1, 6, 1179, 0 };
+    return REL::Module::get().version() == kGOG;
+}
 
 // Per-(file × worldspace) offset record. Layout assumed identical to FNV.
 // VERIFY: confirm size and field order in Ghidra against Skyrim AE 1.6.1170
@@ -48,4 +59,4 @@ using OffsetDataMap = RE::BSTHashMap<RE::TESFile*, OFFSET_DATA*>;
     return nullptr;
 }
 
-}  // namespace cog::sky
+}  // namespace cog

@@ -1,15 +1,55 @@
-// Auto-generated SKSE plugin declaration. Mirrors the file the colorglass
-// vcpkg port's `add_commonlibsse_plugin` macro used to emit. Configured by
-// CMakeLists.txt at generate-time from PROJECT_NAME / PROJECT_VERSION.
+// Auto-generated SKSE plugin declaration. Configured by CMakeLists.txt at
+// generate-time from PROJECT_NAME / PROJECT_VERSION.
+//
+// We write SKSE::PluginVersionData directly instead of using the SKSEPluginInfo
+// / PluginDeclaration wrapper. The wrapper stores compatible versions in
+// std::array<VersionNumber, 16> where VersionNumber's default ctor packs
+// (1,0,0,0)=0x01000000 — so the 12 trailing slots after our 4 explicit
+// versions get filled with junk 1.0.0.0 entries instead of zero-terminators,
+// which SKSE 2.2.6 GOG's loader trips over. PluginVersionData uses a raw
+// uint32_t[16] array that default-initializes to actual zeros.
+//
+// Explicit compatibleVersions list — lets SKSE load us on GOG 1.6.1179 even
+// when no Address Library versionlib bin exists for that build. Internal
+// resolvers (Patches.cpp / EngineCalls.cpp / FindCellInFileTimer.cpp /
+// InteriorHooks.cpp) branch on REL::Module::version() and fall back to raw
+// image-relative offsets on GOG. SE/AE still go through Address Library.
 #include "REL/Relocation.h"
 #include "SKSE/SKSE.h"
 
-SKSEPluginInfo(
-    .Version = REL::Version{ @PROJECT_VERSION_MAJOR@, @PROJECT_VERSION_MINOR@, @PROJECT_VERSION_PATCH@, 0 },
-    .Name = "@PROJECT_NAME@"sv,
-    .Author = "noud"sv,
-    .SupportEmail = ""sv,
-    .StructCompatibility = SKSE::StructCompatibility::Independent,
-    .RuntimeCompatibility = SKSE::VersionIndependence::AddressLibrary,
-    .MinimumSKSEVersion = REL::Version{ 0, 0, 0, 0 }
-)
+namespace {
+constexpr SKSE::PluginVersionData MakePluginVersionData() noexcept
+{
+    SKSE::PluginVersionData v{};
+    v.PluginVersion(REL::Version{ @PROJECT_VERSION_MAJOR@, @PROJECT_VERSION_MINOR@, @PROJECT_VERSION_PATCH@, 0 });
+    v.PluginName("@PROJECT_NAME@");
+    v.AuthorName("noud");
+    v.UsesNoStructs();
+    v.UsesAddressLibrary();
+    v.UsesUpdatedStructs();
+    // GOG: SKSE 2.2.6's hardcoded runtime constant is 0x010649B1 (build=1),
+    // even though SkyrimSE.exe's VERSIONINFO reports 1.6.1179.0 (build=0).
+    // SKSE's plugin-compat check uses the hardcoded constant, so we must list
+    // 1.6.1179.1 here. Our internal resolvers (Patches.cpp / EngineCalls.cpp /
+    // FindCellInFileTimer.cpp / InteriorHooks.cpp) compare against
+    // REL::Module::version() (which reads file metadata = build 0), so they
+    // keep using REL::Version{ 1, 6, 1179, 0 }.
+    v.CompatibleVersions({
+        REL::Version{ 1, 5, 97,   0 },  // SE
+        REL::Version{ 1, 6, 1170, 0 },  // AE (Steam, current)
+        REL::Version{ 1, 6, 1179, 1 },  // GOG 1.6.1179 (SKSE-internal build=1)
+        REL::Version{ 1, 4, 15,   0 },  // VR
+    });
+    return v;
+}
+}
+
+extern "C" [[maybe_unused]] __declspec(dllexport) constinit SKSE::PluginVersionData SKSEPlugin_Version = MakePluginVersionData();
+
+extern "C" [[maybe_unused]] __declspec(dllexport) bool SKSEPlugin_Query(SKSE::QueryInterface*, SKSE::PluginInfo* a_info)
+{
+    a_info->infoVersion = SKSE::PluginInfo::kVersion;
+    a_info->name        = SKSEPlugin_Version.pluginName;
+    a_info->version     = SKSEPlugin_Version.pluginVersion;
+    return true;
+}

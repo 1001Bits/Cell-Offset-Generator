@@ -4,7 +4,7 @@
 
 #include <chrono>
 
-namespace cog::sky {
+namespace cog {
 
 // Records the SKSEPluginLoad start timestamp and exposes a handler that logs
 // elapsed time at each SKSE message phase (kPostLoad, kPostPostLoad,
@@ -23,12 +23,19 @@ public:
     // duplicate log when the loading screen belongs to a save load.
     [[nodiscard]] static bool IsSaveLoadInFlight() { return s_saveLoadInFlight; }
 
+    // Toggles the verbose per-cell logging (top-10 hottest cells +
+    // [ ExteriorCellLoader::LoadCellData ] per-entry list). Off by default;
+    // set from INI [Logging] FindCellInFileLogging at startup.
+    static void SetVerboseCellLogging(bool a_on) { s_verboseCellLogging = a_on; }
+    [[nodiscard]] static bool IsVerboseCellLogging() { return s_verboseCellLogging; }
+
 private:
     static void RegisterLoadingMenuSink();
 
     static inline clock::time_point s_pluginLoadStart{};
     static inline clock::time_point s_saveLoadStart{};
     static inline bool              s_saveLoadInFlight{ false };
+    static inline bool              s_verboseCellLogging{ false };
 };
 
-}  // namespace cog::sky
+}  // namespace cog

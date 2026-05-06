@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.23)
 
 set(NAME "FasterCellLookup")
-set(VERSION 1.3.0)
+set(VERSION 1.5.0)
 
 message(">>> Start build for '${NAME}' v${VERSION}")
 

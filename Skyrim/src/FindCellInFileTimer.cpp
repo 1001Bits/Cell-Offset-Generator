@@ -1,10 +1,15 @@
 #include "PCH.h"
-#include "skyrim/FindCellInFileTimer.h"
+#include "FindCellInFileTimer.h"
 
+#include "EngineTypes.h"
+
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <mutex>
+#include <unordered_map>
 
-namespace cog::sky {
+namespace cog {
 
 namespace {
 
@@ -16,6 +21,43 @@ FindCellInFile_t g_origFindCell{ nullptr };
 std::atomic<std::uint64_t> g_calls{};
 std::atomic<std::uint64_t> g_totalNs{};
 std::atomic<std::uint64_t> g_maxNs{};
+std::atomic<std::uint64_t> g_fastCalls{};
+std::atomic<std::uint64_t> g_slowCalls{};
+std::atomic<std::uint64_t> g_slowTotalNs{};
+
+// Per-(world, x, y) attribution. Hot-path lookup is mutex-protected; with
+// ~150 unique cells per FT × ~150 ns per locked increment that's ~25 µs of
+// measurement overhead total per transition — negligible against the 290 ms
+// of FindCellInFile work. Map key count is small (unique cells, not calls)
+// so memory is bounded.
+struct CellKey
+{
+    RE::TESWorldSpace* world;
+    std::int32_t       x;
+    std::int32_t       y;
+
+    bool operator==(const CellKey& o) const noexcept
+    { return world == o.world && x == o.x && y == o.y; }
+};
+struct CellKeyHash
+{
+    std::size_t operator()(const CellKey& k) const noexcept
+    {
+        auto h = reinterpret_cast<std::uintptr_t>(k.world);
+        h = h * 0x9E3779B97F4A7C15ull + static_cast<std::uint32_t>(k.x);
+        h = h * 0x9E3779B97F4A7C15ull + static_cast<std::uint32_t>(k.y);
+        return static_cast<std::size_t>(h);
+    }
+};
+struct CellTally
+{
+    std::uint64_t calls   = 0;
+    std::uint64_t totalNs = 0;
+    std::uint64_t maxNs   = 0;
+};
+
+std::mutex                                                      g_perCellMutex;
+std::unordered_map<CellKey, CellTally, CellKeyHash>             g_perCell;
 
 bool FindCellInFile_Hook(RE::TESWorldSpace* a_world, RE::TESFile* a_file,
                          std::int32_t a_x, std::int32_t a_y)
@@ -29,11 +71,27 @@ bool FindCellInFile_Hook(RE::TESWorldSpace* a_world, RE::TESFile* a_file,
 
     g_calls.fetch_add(1, std::memory_order_relaxed);
     g_totalNs.fetch_add(ns, std::memory_order_relaxed);
+    if (ns >= kSlowThresholdNs) {
+        g_slowCalls.fetch_add(1, std::memory_order_relaxed);
+        g_slowTotalNs.fetch_add(ns, std::memory_order_relaxed);
+    } else {
+        g_fastCalls.fetch_add(1, std::memory_order_relaxed);
+    }
 
     auto curMax = g_maxNs.load(std::memory_order_relaxed);
     while (ns > curMax &&
            !g_maxNs.compare_exchange_weak(curMax, ns,
                                           std::memory_order_relaxed)) {
+    }
+
+    {
+        std::lock_guard lock(g_perCellMutex);
+        auto& t = g_perCell[CellKey{ a_world, a_x, a_y }];
+        ++t.calls;
+        t.totalNs += ns;
+        if (ns > t.maxNs) {
+            t.maxNs = ns;
+        }
     }
     return result;
 }
@@ -43,12 +101,15 @@ bool FindCellInFile_Hook(RE::TESWorldSpace* a_world, RE::TESFile* a_file,
     if (REL::Module::IsVR()) {
         return REL::Offset(0x2C32D0).address();
     }
+    if (IsGOG()) {
+        return REL::Offset(0x3062F0).address();
+    }
     return REL::RelocationID(20022, 20456).address();
 }
 
 }  // namespace
 
-bool InstallFindCellInFileTimer()
+bool FindCellInFileTimer::InitHooks()
 {
     const auto addr = ResolveFindCellInFile();
     if (addr == 0) {
@@ -64,14 +125,28 @@ bool InstallFindCellInFileTimer()
     // thunk ourselves, then use write_branch only to install the source JMP
     // (where its address-distance handling via FF 25 sub-thunk is correct).
     //
-    // FindCellInFile prologue (verified in binary):
+    // FindCellInFile prologue is identical across all four runtimes
+    // (verified by Ghidra dumps for SE 1.5.97, AE 1.6.1170, VR 1.4.15,
+    // GOG 1.6.1179):
     //   40 53 55 56 57   push rbx; push rbp; push rsi; push rdi   (5 bytes — clean boundary)
     //
-    // Thunk layout:
-    //   [0..5]   copy of prologue (position-independent pushes)
-    //   [5..10]  E9 + rel32 jump back to source+5
+    // v1.4.3: verify the bytes match before we splice. If another mod has
+    // already hooked the function or the runtime is unexpected, refuse to
+    // patch rather than corrupting the function entry.
     constexpr std::size_t kDisplaced = 5;
     constexpr std::size_t kThunkSize = kDisplaced + 5;
+    constexpr std::uint8_t kExpectedPrologue[kDisplaced] = { 0x40, 0x53, 0x55, 0x56, 0x57 };
+
+    const auto* targetBytes = reinterpret_cast<const std::uint8_t*>(addr);
+    for (std::size_t i = 0; i < kDisplaced; ++i) {
+        if (targetBytes[i] != kExpectedPrologue[i]) {
+            logger::error("FindCellInFileTimer: prologue mismatch at +{:X} byte {} — "
+                          "expected {:02X}, got {:02X}; refusing to splice",
+                          addr - REL::Module::get().base(), i,
+                          kExpectedPrologue[i], targetBytes[i]);
+            return false;
+        }
+    }
 
     auto* thunk = static_cast<std::uint8_t*>(trampoline.allocate(kThunkSize));
     if (!thunk) {
@@ -112,7 +187,29 @@ FindCellStats SnapshotAndResetFindCell()
         g_calls.exchange(0, std::memory_order_relaxed),
         g_totalNs.exchange(0, std::memory_order_relaxed),
         g_maxNs.exchange(0, std::memory_order_relaxed),
+        g_fastCalls.exchange(0, std::memory_order_relaxed),
+        g_slowCalls.exchange(0, std::memory_order_relaxed),
+        g_slowTotalNs.exchange(0, std::memory_order_relaxed),
     };
 }
 
-}  // namespace cog::sky
+std::vector<PerCellEntry> SnapshotAndResetPerCell()
+{
+    std::unordered_map<CellKey, CellTally, CellKeyHash> snapshot;
+    {
+        std::lock_guard lock(g_perCellMutex);
+        snapshot.swap(g_perCell);
+    }
+    std::vector<PerCellEntry> entries;
+    entries.reserve(snapshot.size());
+    for (const auto& [k, v] : snapshot) {
+        entries.push_back({ k.world, k.x, k.y, v.calls, v.totalNs, v.maxNs });
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const PerCellEntry& a, const PerCellEntry& b) {
+                  return a.totalNs > b.totalNs;
+              });
+    return entries;
+}
+
+}  // namespace cog

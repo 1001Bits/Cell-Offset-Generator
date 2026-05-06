@@ -1,9 +1,42 @@
+# Build outputs
 build/
+build-*/
 out/
+
+# IDE / VS
 .vs/
 .vscode/
 *.user
 *.suo
 *.aps
 CMakeUserPresets.json
+
+# vcpkg
 vcpkg_installed/
+
+# Distribution staging (release zips go to GitHub releases, not git)
+dist/
+
+# Local scratch / tools
+.tmp/
+bridge_mcp_ghidra.py
+persistentify-inspect/
+d3dx9_42.log
+*.log
+*.tlog
+
+# Compiled binaries
+*.dll
+*.pdb
+*.exe
+*.lib
+*.exp
+*.obj
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# Claude Code local state
+.claude/
+CLAUDE.md

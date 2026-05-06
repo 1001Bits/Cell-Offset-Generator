@@ -1,9 +1,9 @@
 #pragma once
 
 #include "PCH.h"
-#include "skyrim/EngineTypes.h"
+#include "EngineTypes.h"
 
-namespace cog::sky {
+namespace cog {
 
 // Direct calls into Skyrim's worldspace internals. Per-runtime offsets
 // configured in EngineCalls.cpp. All functions are non-virtual member
@@ -35,4 +35,4 @@ namespace cog::sky {
 [[nodiscard]] OFFSET_DATA* GetOrCreateOffsetData(RE::TESWorldSpace* a_world,
                                                  RE::TESFile* a_file);
 
-}  // namespace cog::sky
+}  // namespace cog

@@ -1,9 +1,9 @@
 #include "PCH.h"
-#include "skyrim/Patches.h"
+#include "Patches.h"
 
-#include "cog/Settings.h"
+#include "Settings.h"
 
-namespace cog::sky {
+namespace cog {
 
 namespace {
 
@@ -22,14 +22,13 @@ struct PatchSite
     std::uint8_t   expected[6];  // verification bytes (unused tail = 0)
 };
 
-// Patch sites cover EXTERIOR cell paths only. The original NVSE Cell-Offset-
-// Generator deliberately leaves ESP interior cells on the vanilla path (per
-// the InteriorOffsets.hpp comment: "ESP makes cell contents always loaded …
-// only master files have offsets"). Earlier versions of this port NOPed two
-// extra interior gates (Load.interiorFileOffset, CELL.FindInFileFast) and
-// eagerly wrote INTERIOR_DATA+0x5C; that caused interior→exterior CTDs that
-// baked into save state. Reverting to vanilla interior behavior matches the
-// original NVSE design.
+// Patch sites cover EXTERIOR cell paths only. ESP interior cells stay on the
+// vanilla path: ESPs make cell contents perma-resident after the initial
+// data-load parse, so the engine never re-streams interiors and never calls
+// FindInFileFast on them. Earlier versions of this port NOPed two extra
+// interior gates (Load.interiorFileOffset, CELL.FindInFileFast) and eagerly
+// wrote INTERIOR_DATA+0x5C; that caused interior→exterior CTDs that baked
+// into save state.
 
 // AE 1.6.1170 — verified working.
 constexpr PatchSite kPatchSitesAE_1_6_1170[] = {
@@ -65,15 +64,29 @@ constexpr PatchSite kPatchSitesVR_1_4_15[] = {
     { 0x1402C32F6, 2, "FindCellInFile",             Group::Lookup, { 0x74, 0x63 } },
 };
 
+// GOG 1.6.1179 — verified via Ghidra (SkyrimSE GOG). Each site shifted -0x1D0
+// from its AE 1.6.1170 counterpart; expected bytes are byte-identical to AE.
+constexpr PatchSite kPatchSitesGOG_1_6_1179[] = {
+    { 0x140305222, 2, "Load.fileOffset",            Group::Load,   { 0x74, 0x15 } },
+    { 0x140305396, 6, "Load.offsetMinCoords",       Group::Load,   { 0x0F, 0x84, 0x91, 0x05, 0x00, 0x00 } },
+    { 0x14030550F, 6, "Load.offsetMaxCoords",       Group::Load,   { 0x0F, 0x84, 0x18, 0x04, 0x00, 0x00 } },
+    { 0x140305D9E, 6, "LoadPartial.gate1",          Group::Load,   { 0x0F, 0x84, 0x99, 0x00, 0x00, 0x00 } },
+    { 0x140305E25, 2, "LoadPartial.gate2",          Group::Load,   { 0x74, 0x16 } },
+    { 0x14030681C, 2, "FindInFileFast",             Group::Lookup, { 0x74, 0x48 } },
+    { 0x140306316, 2, "FindCellInFile",             Group::Lookup, { 0x74, 0x63 } },
+};
+
 [[nodiscard]] std::span<const PatchSite> PickPatchSites()
 {
     const auto ver = REL::Module::get().version();
     constexpr REL::Version kAE{ 1, 6, 1170, 0 };
     constexpr REL::Version kSE{ 1, 5, 97, 0 };
     constexpr REL::Version kVR{ 1, 4, 15, 0 };
-    if (ver == kAE) return { kPatchSitesAE_1_6_1170 };
-    if (ver == kSE) return { kPatchSitesSE_1_5_97 };
-    if (ver == kVR) return { kPatchSitesVR_1_4_15 };
+    constexpr REL::Version kGOG{ 1, 6, 1179, 0 };
+    if (ver == kAE)  return { kPatchSitesAE_1_6_1170 };
+    if (ver == kSE)  return { kPatchSitesSE_1_5_97 };
+    if (ver == kVR)  return { kPatchSitesVR_1_4_15 };
+    if (ver == kGOG) return { kPatchSitesGOG_1_6_1179 };
     return {};
 }
 
@@ -103,7 +116,7 @@ constexpr PatchSite kPatchSitesVR_1_4_15[] = {
 
 }  // namespace
 
-bool InstallEsmGateNops(const cog::Settings& a_settings)
+bool Patches::InitHooks(const Settings& a_settings)
 {
     const auto& mod = REL::Module::get();
     const auto ver = mod.version();
@@ -111,7 +124,7 @@ bool InstallEsmGateNops(const cog::Settings& a_settings)
 
     if (sites.empty()) {
         logger::warn("Patches: no NOP sites configured for runtime {} — "
-                     "supported: AE 1.6.1170, SE 1.5.97, VR 1.4.15.",
+                     "supported: AE 1.6.1170, SE 1.5.97, VR 1.4.15, GOG 1.6.1179.",
                      ver.string());
         return false;
     }
@@ -149,4 +162,4 @@ bool InstallEsmGateNops(const cog::Settings& a_settings)
     return allOk;
 }
 
-}  // namespace cog::sky
+}  // namespace cog
