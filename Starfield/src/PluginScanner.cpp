@@ -29,10 +29,16 @@ constexpr std::uint32_t kSigXXXX = 0x58585858u;  // "XXXX"
 constexpr std::uint32_t kSigNAM0 = 0x304D414Eu;  // "NAM0" (min corner, 2x float, world units)
 constexpr std::uint32_t kSigNAM9 = 0x394D414Eu;  // "NAM9" (max corner, 2x float, world units)
 
-// Starfield exterior cell size in world units. Verified empirically against
-// the engine constant DAT_14479ed14 (0.01f = 1/100) — see
-// CellOffsetGenerator.cpp's note on this.
-constexpr float kCellWorldUnits = 100.0f;
+// World-unit -> cell-coord scale. MUST be bit-identical to the engine's
+// GetIndexForCellCoord (FUN_140BB8600), which computes the cell index from
+// pData's NAM0/NAM9 floats as `floor(0.01f * worldUnits)` in SINGLE precision,
+// using the constant at 0x144F07F7C = 0x3C23D70A = 0.01f (≈0.00999999978).
+// We MUST replicate this exactly: dividing by 100.0 (exact) instead of
+// multiplying by 0.01f (imprecise) floors a different integer at exact cell
+// boundaries (e.g. 4200.0 -> ours 42 vs engine 41), which mis-sizes/mis-indexes
+// the OFST table for any worldspace whose NAM bounds land on a boundary —
+// loading wrong cell data for a whole region of that world.
+constexpr float kCellScale = 0.01f;  // == engine's 0x144F07F7C
 
 struct XclcData
 {
@@ -211,8 +217,10 @@ bool WalkContainer(Reader& r, std::uint64_t a_end,
                     } else if ((subType == kSigNAM0 || subType == kSigNAM9) && subSize == 8) {
                         float fx, fy;
                         if (r.read(&fx, 4) && r.read(&fy, 4)) {
-                            const auto cellX = static_cast<std::int32_t>(std::floor(fx / kCellWorldUnits));
-                            const auto cellY = static_cast<std::int32_t>(std::floor(fy / kCellWorldUnits));
+                            // Single-precision multiply by 0.01f then floor —
+                            // bit-identical to the engine's GetIndexForCellCoord.
+                            const auto cellX = static_cast<std::int32_t>(std::floor(kCellScale * fx));
+                            const auto cellY = static_cast<std::int32_t>(std::floor(kCellScale * fy));
                             if (subType == kSigNAM0) {
                                 w.nam0CellX = cellX;
                                 w.nam0CellY = cellY;
@@ -330,7 +338,7 @@ bool ScanPluginFile(const std::filesystem::path& a_path, ScanResult& a_out)
 namespace {
 
 constexpr std::uint32_t kCacheMagic   = 0x46435350u;  // 'PSCF' = "Plugin Scan Cache File"
-constexpr std::uint32_t kCacheVersion = 6u;            // v6: pluginHash is now a size+mtime signature, not a content hash
+constexpr std::uint32_t kCacheVersion = 7u;            // v7: NAM cell bounds now use engine-exact floor(0.01f*x) (was floor(x/100))
 
 struct CacheHeader
 {

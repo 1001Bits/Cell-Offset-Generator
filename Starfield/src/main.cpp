@@ -52,13 +52,6 @@ namespace
         switch (a_message->type) {
         case SFSE::MessagingInterface::kPostDataLoad:
             if (!ran.exchange(true)) {
-                // Diagnostics-only: dump pre-generator OFFSET_DATA state +
-                // the struct-finder scan. Noisy and only useful for debugging,
-                // so it's gated off in clean release builds.
-                if (cog::sf::bench::IsDiagnosticsMode()) {
-                    OffsetGenerator::DumpEnginePreState();
-                }
-
                 // Skip the generator's own slow scan in baseline mode — the
                 // run is supposed to mimic vanilla, and the generator would
                 // call FindCellInFile thousands of times before any engine
@@ -108,14 +101,6 @@ namespace
                 if (!savings.empty()) logger::info("{}", savings);
                 const auto perCellSingle = cog::sf::bench::FormatPerCellSingleRun();
                 if (!perCellSingle.empty()) logger::info("{}", perCellSingle);
-                // Every 60s, dump the engine's current OFFSET_DATA state for
-                // sampled worlds. After the player has visited a worldspace
-                // the engine will have lazily walked its WRLD record and may
-                // have overwritten pData->fileOffset — comparing to our
-                // generation-time wrldFileOffset reveals the gap.
-                if ((tick & 1) == 0) {
-                    OffsetGenerator::DumpEnginePreState();
-                }
                 spdlog::default_logger()->flush();
             }
         }).detach();
