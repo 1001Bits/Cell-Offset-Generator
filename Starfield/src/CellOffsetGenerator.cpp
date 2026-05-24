@@ -105,30 +105,6 @@ constexpr std::uint32_t kMaxReasonableTableSize = 4 * 1024 * 1024;
 // if a future SF patch reshuffles function bodies.
 namespace {
 
-// Guard against using a BSTArray whose struct offset isn't pinned (e.g.
-// smallFiles on 1.16.236, which is NOT at TESFileCollection+0x10). A sane
-// array has size<=cap, a bounded capacity, and either an empty body or a
-// committed, readable data pointer. Prevents dereferencing garbage triples.
-template <class Arr>
-[[nodiscard]] bool ArrayLooksSane(const Arr& a_arr)
-{
-    const auto sz  = a_arr.size();
-    const auto cap = a_arr.capacity();
-    constexpr std::uint32_t kMaxPlausible = 100000u;
-    if (cap > kMaxPlausible || sz > cap) return false;
-    if (sz == 0) return true;
-    const void* d = a_arr.data();
-    if (reinterpret_cast<std::uintptr_t>(d) < 0x10000) return false;
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (::VirtualQuery(d, &mbi, sizeof(mbi)) == 0) return false;
-    if (mbi.State != MEM_COMMIT) return false;
-    if ((mbi.Protect & PAGE_GUARD) || (mbi.Protect & 0xFF) == PAGE_NOACCESS) return false;
-    // Need room for `sz` pointers from d to the end of the committed region.
-    const auto start = reinterpret_cast<std::uintptr_t>(d);
-    const auto end   = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    return start + static_cast<std::uintptr_t>(sz) * sizeof(void*) <= end;
-}
-
 using GetAllocContext_t = void* (*)();
 using AllocFn_t         = void* (*)(void* /*ctx*/, std::size_t /*size*/,
                                     std::size_t /*alignment*/, std::size_t /*flags*/);
