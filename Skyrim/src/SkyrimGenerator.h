@@ -7,6 +7,27 @@
 
 namespace cog {
 
+// Cheap plugin identity for the cache fast-path: size + last-write time,
+// fetched with one GetFileAttributesExW (no content read).
+struct FileStamp
+{
+    std::uint64_t size{ 0 };
+    std::uint64_t mtime{ 0 };
+    bool          valid{ false };
+};
+
+// Computes a plugin's content xxh3 at most once, lazily. Only touched when
+// the (size, mtime) stamp doesn't match the cached header, or when a fresh
+// table is generated and needs a hash written into the new cache header.
+struct LazyFileHash
+{
+    const std::filesystem::path& path;
+    std::uint64_t                value{ 0 };
+    bool                         computed{ false };
+
+    std::uint64_t Get();  // defined in SkyrimGenerator.cpp (needs HashFile)
+};
+
 // Drives the cell-offset regeneration pass: per (file × worldspace) it tries
 // the .fco cache first, then runs FindCellInFile across the worldspace bounds
 // to fill `pCellFileOffsets` and persist the result. Owns its own thread pool;
@@ -30,9 +51,10 @@ public:
         // it on a prior run).
         std::atomic<std::uint32_t> cacheHits{ 0 };
         std::atomic<std::uint32_t> emptyWorlds{ 0 };
-        // Worldspace had no cells but valid bounds; we installed a zero-valued
-        // pCellFileOffsets so the engine's editor-ID lookup path doesn't crash
-        // on null-deref. Subset of emptyWorlds.
+        // Fallback path for runtimes where we could not install the original-
+        // style safe editor-ID lookup patch: install a zero-valued
+        // pCellFileOffsets so the engine doesn't null-deref on empty worlds.
+        // Subset of emptyWorlds.
         std::atomic<std::uint32_t> emptySentinels{ 0 };
     };
 
@@ -42,9 +64,12 @@ public:
     [[nodiscard]] std::filesystem::path GetCacheRoot() const;
 
 private:
-    bool ProcessWorld(RE::TESFile* a_file, std::uint64_t a_fileHash, RE::TESWorldSpace* a_world);
+    bool ProcessWorld(RE::TESFile* a_ownerFile, RE::TESFile* a_workerFile,
+                      const FileStamp& a_stamp, LazyFileHash& a_fileHash,
+                      RE::TESWorldSpace* a_world);
 
-    std::uint32_t Generate(RE::TESFile* a_file, RE::TESWorldSpace* a_world,
+    std::uint32_t Generate(RE::TESFile* a_ownerFile, RE::TESFile* a_workerFile,
+                           RE::TESWorldSpace* a_world,
                            OFFSET_DATA* a_data, std::vector<std::uint32_t>& a_offsets);
 
     [[nodiscard]] std::uint32_t* InstallEngineArray(std::span<const std::uint32_t> a_offsets);

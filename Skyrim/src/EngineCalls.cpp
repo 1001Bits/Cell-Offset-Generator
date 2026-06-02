@@ -23,7 +23,7 @@ struct EngineFunc
 // (SE); VR + GOG offsets verified via Ghidra.
 constexpr EngineFunc kFindCellInFile       { 20022, 20456, 0x2C32D0, 0x3062F0 };
 constexpr EngineFunc kGetIndexForCellCoord { 20023, 20457, 0x2C3560, 0x306580 };
-constexpr EngineFunc kGetOrCreateOffsetData{ 20110, 20560, 0x2C9210, 0x30C8B0 };
+constexpr EngineFunc kGetOrCreateOffsetData{ 20110, 20560, 0x2C92D0, 0x30C8B0 };
 
 [[nodiscard]] std::uintptr_t Resolve(const EngineFunc& a_func)
 {

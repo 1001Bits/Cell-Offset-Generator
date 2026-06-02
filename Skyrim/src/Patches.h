@@ -14,6 +14,7 @@ class Patches
 {
 public:
     [[nodiscard]] static bool InitHooks(const Settings& a_settings);
+    [[nodiscard]] static bool HasSafeLookupPatch() noexcept;
 };
 
 }  // namespace cog
