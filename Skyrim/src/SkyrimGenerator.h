@@ -4,6 +4,9 @@
 #include "EngineTypes.h"
 
 #include <atomic>
+#include <optional>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace cog {
 
@@ -26,6 +29,48 @@ struct LazyFileHash
     bool                         computed{ false };
 
     std::uint64_t Get();  // defined in SkyrimGenerator.cpp (needs HashFile)
+};
+
+// Ground truth about a plugin's exterior cells, read straight from the file's
+// GRUP structure (record headers only — compressed record bodies are skipped,
+// never inflated). Keyed by the in-file WRLD record's objectID (low 24 bits).
+// Used to verify generated tables before they are published or cached: the
+// engine treats a zero table entry as "this file does not contain this cell"
+// with NO slow-path fallback, so an unverified table converts any generation
+// miss (transient IO failure, closed stream, bounds narrower than content)
+// into permanently missing cell content.
+struct WorldCellCounts
+{
+    // Exterior CELL records the engine's slow-scan probe can DEFINITELY
+    // match: carrying data, no skip-relevant flags.
+    std::uint32_t clean{ 0 };
+    // Records whose probe-matchability depends on unverified engine flag
+    // semantics: deleted (0x20) or 0x400-flagged records with data, and
+    // zero-size (data-stripped) records. They extend only the UPPER bound
+    // of the verification band, so the gate is correct regardless of
+    // whether the engine matches them.
+    std::uint32_t uncertain{ 0 };
+    // A persistent CELL directly in the world-children group (XCLC
+    // conventionally 0,0) can satisfy one probe without being a block cell.
+    bool persistent{ false };
+};
+
+struct PluginScan
+{
+    std::unordered_map<std::uint32_t, WorldCellCounts> worlds;
+    std::unordered_set<std::uint32_t>                  ambiguousWorlds;
+};
+
+// Scans a plugin at most once, lazily; only runs on the generation path
+// (cache hits via the stamp fast-path never touch the file).
+struct LazyPluginScan
+{
+    const std::filesystem::path&    path;
+    std::optional<PluginScan>       value;
+    bool                            computed{ false };
+
+    // nullptr = file could not be parsed (unreadable / malformed structure).
+    const PluginScan* Get();  // defined in SkyrimGenerator.cpp
 };
 
 // Drives the cell-offset regeneration pass: per (file × worldspace) it tries
@@ -56,6 +101,14 @@ public:
         // pCellFileOffsets so the engine doesn't null-deref on empty worlds.
         // Subset of emptyWorlds.
         std::atomic<std::uint32_t> emptySentinels{ 0 };
+        // Generated tables whose cell count did NOT match the plugin's actual
+        // records (transient IO failure, closed stream, or NAM0/NAM9 bounds
+        // narrower than the file's content). Not published, not cached — the
+        // engine keeps its (correct) slow path for these.
+        std::atomic<std::uint32_t> mismatched{ 0 };
+        // Plugins whose GRUP structure could not be parsed for verification.
+        // Their tables are not published or cached either.
+        std::atomic<std::uint32_t> scanFailed{ 0 };
     };
 
     void Run();
@@ -64,12 +117,11 @@ public:
     [[nodiscard]] std::filesystem::path GetCacheRoot() const;
 
 private:
-    bool ProcessWorld(RE::TESFile* a_ownerFile, RE::TESFile* a_workerFile,
-                      const FileStamp& a_stamp, LazyFileHash& a_fileHash,
+    bool ProcessWorld(RE::TESFile* a_file, const FileStamp& a_stamp,
+                      LazyFileHash& a_fileHash, LazyPluginScan& a_scan,
                       RE::TESWorldSpace* a_world);
 
-    std::uint32_t Generate(RE::TESFile* a_ownerFile, RE::TESFile* a_workerFile,
-                           RE::TESWorldSpace* a_world,
+    std::uint32_t Generate(RE::TESFile* a_file, RE::TESWorldSpace* a_world,
                            OFFSET_DATA* a_data, std::vector<std::uint32_t>& a_offsets);
 
     [[nodiscard]] std::uint32_t* InstallEngineArray(std::span<const std::uint32_t> a_offsets);

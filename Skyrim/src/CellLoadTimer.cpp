@@ -92,7 +92,13 @@ void __fastcall CellLoad_Hook(std::uint32_t* a_req, void* a_out)
 
     {
         std::lock_guard lock(g_entriesMutex);
-        g_entries.push_back({ reqFormID, x, y, ns, isExterior });
+        // Entries drain on loading-screen close; nothing drains them during
+        // long uninterrupted outdoor play, so cap growth. The totalNs
+        // aggregate keeps counting either way.
+        constexpr std::size_t kMaxEntries = 8192;
+        if (g_entries.size() < kMaxEntries) {
+            g_entries.push_back({ reqFormID, x, y, ns, isExterior });
+        }
     }
     g_totalNs.fetch_add(ns, std::memory_order_relaxed);
 }

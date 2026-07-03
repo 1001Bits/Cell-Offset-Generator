@@ -10,13 +10,16 @@
 #define XXH_ENABLE_AUTOVECTORIZE
 #include <xxhash.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <fstream>
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace cog {
@@ -51,34 +54,21 @@ namespace {
         nullptr);
 }
 
-// Hash a plugin file. Tries the caller's path first; on
-// ERROR_FILE_NOT_FOUND we retry with a relative `Data\<filename>` path,
-// because MO2's Wabbajack "Stock Game" pattern uses USVFS to overlay
-// mod files into the virtual Data dir and only redirects relative-path
-// CreateFileW calls — absolute paths to the same logical target bypass
-// the overlay and resolve to the real (mostly empty) Data folder. The
-// engine itself uses relative paths so its loads succeed; without the
-// fallback our absolute path missed every mod plugin (Mages & Vikings
-// modlist reported err=2 for ~500 plugins). The exe-relative absolute
-// path remains the primary attempt because Skyrim VR with MO2's USVFS
-// leaves cwd as the MO2 profile dir, not the game folder, so a pure
-// cwd-relative path fails there.
+// Hash a plugin file at an already-resolved path (see ResolvePluginPath —
+// the resolution happens ONCE per file so the stamp, the content hash, and
+// the verification scan all describe the SAME physical file). Returns 0 on
+// failure; callers must treat 0 as "identity unknown" and never persist or
+// trust a cache entry keyed to it (0 is not a usable hash value — a second
+// failing read would also produce 0 and vacuously "match").
 [[nodiscard]] std::uint64_t HashFile(const std::filesystem::path& a_path,
                                      std::uint32_t* a_winErrorOut = nullptr)
 {
     HANDLE handle = OpenPluginForHash(a_path);
     if (handle == INVALID_HANDLE_VALUE) {
-        const auto firstErr = GetLastError();
-        if (firstErr == ERROR_FILE_NOT_FOUND || firstErr == ERROR_PATH_NOT_FOUND) {
-            const auto fallback = std::filesystem::path(L"Data") / a_path.filename();
-            handle = OpenPluginForHash(fallback);
+        if (a_winErrorOut) {
+            *a_winErrorOut = GetLastError();
         }
-        if (handle == INVALID_HANDLE_VALUE) {
-            if (a_winErrorOut) {
-                *a_winErrorOut = firstErr;
-            }
-            return 0;
-        }
+        return 0;
     }
 
     auto* state = XXH3_createState();
@@ -88,16 +78,37 @@ namespace {
     }
     XXH3_64bits_reset(state);
 
+    // Distinguish EOF from a mid-file read error: hashing a silently
+    // truncated read would produce an "authoritative" hash of content the
+    // engine never saw. Capture the error code IMMEDIATELY — FreeState /
+    // CloseHandle below would overwrite GetLastError.
+    std::uint32_t readError = 0;
     constexpr DWORD kBufferSize = 64 * 1024;
     std::vector<char> buffer(kBufferSize);
-    DWORD read = 0;
-    while (ReadFile(handle, buffer.data(), kBufferSize, &read, nullptr) && read > 0) {
+    for (;;) {
+        DWORD read = 0;
+        if (!ReadFile(handle, buffer.data(), kBufferSize, &read, nullptr)) {
+            readError = GetLastError();
+            if (readError == 0) {
+                readError = ERROR_READ_FAULT;
+            }
+            break;
+        }
+        if (read == 0) {
+            break;  // EOF
+        }
         XXH3_64bits_update(state, buffer.data(), read);
     }
 
     const auto digest = XXH3_64bits_digest(state);
     XXH3_freeState(state);
     CloseHandle(handle);
+    if (readError != 0) {
+        if (a_winErrorOut) {
+            *a_winErrorOut = readError;
+        }
+        return 0;
+    }
     return digest;
 }
 
@@ -109,41 +120,312 @@ std::uint64_t LazyFileHash::Get()
         std::uint32_t winError = 0;
         value    = HashFile(path, &winError);
         computed = true;
+        if (value == 0) {
+            // Surface this loudly: a zero hash means the plugin's tables are
+            // never cached (regenerated every boot) — without this line the
+            // log gives support no way to see why the .fco never appears.
+            logger::warn("Generator: failed to hash '{}' (err={}) — results "
+                         "for this plugin will not be cached",
+                         path.string(), winError);
+        }
     }
     return value;
 }
 
 namespace {
 
-// Fetch (size, mtime) with a single GetFileAttributesExW (no content read).
-// Used as the cache fast-path key; the content xxh3 is the fallback when the
-// stamp doesn't match. Tries the caller's path first, then the relative
-// `Data\<name>` form for MO2's USVFS "Stock Game" overlay — same fallback
-// rationale as HashFile.
-[[nodiscard]] FileStamp StatPlugin(const std::filesystem::path& a_path)
+// Fetch (size, mtime) with a single GetFileAttributesExW (no content read)
+// at the already-resolved path — the SAME path HashFile and the verification
+// scan use, so the v4+ header's stamp and hash always describe one physical
+// file. On failure a_winErrorOut receives the error for THIS path (not a
+// fallback's).
+[[nodiscard]] FileStamp StatPlugin(const std::filesystem::path& a_path,
+                                   std::uint32_t* a_winErrorOut = nullptr)
 {
-    auto tryStat = [](const std::filesystem::path& a_p, FileStamp& a_out) {
-        WIN32_FILE_ATTRIBUTE_DATA fad{};
-        if (!GetFileAttributesExW(a_p.c_str(), GetFileExInfoStandard, &fad)) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(a_path.c_str(), GetFileExInfoStandard, &fad)) {
+        if (a_winErrorOut) {
+            *a_winErrorOut = GetLastError();
+        }
+        return {};
+    }
+    FileStamp stamp{};
+    stamp.size  = (static_cast<std::uint64_t>(fad.nFileSizeHigh) << 32) |
+                  fad.nFileSizeLow;
+    stamp.mtime = (static_cast<std::uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
+                  fad.ftLastWriteTime.dwLowDateTime;
+    stamp.valid = true;
+    return stamp;
+}
+
+// ── Raw plugin scan (verification ground truth) ─────────────────────────────
+//
+// Walks the plugin's GRUP structure reading record/group HEADERS only (24
+// bytes each; record bodies — including zlib-compressed CELLs — are seeked
+// over, never inflated) and counts the exterior CELL records per worldspace,
+// keyed by the in-file WRLD record's objectID (low 24 bits).
+//
+// Why this exists: the engine treats a zero entry in pCellFileOffsets as
+// "this file does not contain this cell" with NO slow-path fallback. So a
+// generated table may only be published/cached if the number of cells the
+// FindCellInFile probes located EXACTLY matches the number of exterior CELL
+// records the file actually contains. A mismatch means either a transient
+// probe failure (closed stream, IO error — would otherwise permanently bake
+// missing content into the cache) or NAM0/NAM9 bounds narrower than the
+// file's real content (tool-generated plugins, e.g. DynDOLOD — cells outside
+// the stated bounds are unreachable by the fast path). Either way the safe
+// answer is: leave the engine's slow path alone for that (file, world).
+//
+// SE plugin format (both record and group headers are 24 bytes):
+//   Record: char sig[4]; u32 dataSize; u32 flags; u32 formID; u32 vc;
+//           u16 version; u16 unk;   → followed by dataSize bytes
+//   Group:  "GRUP"; u32 groupSize (INCLUDES this 24-byte header); u8 label[4];
+//           s32 groupType; u16 stamp; u16 unk; u16 version; u16 unk2;
+//   groupType: 0=top(label=fourcc) 1=world children(label=WRLD formID)
+//              4=exterior block 5=exterior sub-block 6..9=cell/topic children
+//
+// Parsing is lenient about CONTENT (unknown records/groups are skipped) but
+// strict about STRUCTURE (any size that escapes its parent bounds aborts the
+// scan) — a failed scan disables publish/cache for the file, never content.
+
+constexpr std::uint32_t kSigGRUP = 0x50555247;  // "GRUP"
+constexpr std::uint32_t kSigWRLD = 0x444C5257;  // "WRLD"
+constexpr std::uint32_t kSigCELL = 0x4C4C4543;  // "CELL"
+constexpr std::uint32_t kSigTES4 = 0x34534554;  // "TES4"
+
+struct RawHeader
+{
+    std::uint32_t sig;
+    std::uint32_t sizeField;   // record: dataSize (excl. header); GRUP: total (incl. header)
+    std::uint32_t labelOrFlags;
+    std::uint32_t typeOrFormID;
+};
+
+class PluginReader
+{
+public:
+    explicit PluginReader(HANDLE a_handle) : m_handle(a_handle) {}
+
+    [[nodiscard]] bool ReadHeader(std::uint64_t a_at, RawHeader& a_out)
+    {
+        std::uint8_t raw[24];
+        if (!ReadAt(a_at, raw, sizeof(raw))) {
             return false;
         }
-        a_out.size  = (static_cast<std::uint64_t>(fad.nFileSizeHigh) << 32) |
-                      fad.nFileSizeLow;
-        a_out.mtime = (static_cast<std::uint64_t>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
-                      fad.ftLastWriteTime.dwLowDateTime;
-        a_out.valid = true;
+        std::memcpy(&a_out.sig,         raw + 0,  4);
+        std::memcpy(&a_out.sizeField,   raw + 4,  4);
+        std::memcpy(&a_out.labelOrFlags, raw + 8, 4);
+        std::memcpy(&a_out.typeOrFormID, raw + 12, 4);
         return true;
-    };
+    }
 
-    FileStamp stamp{};
-    if (tryStat(a_path, stamp)) {
-        return stamp;
+private:
+    [[nodiscard]] bool ReadAt(std::uint64_t a_at, void* a_buf, DWORD a_size)
+    {
+        LARGE_INTEGER li;
+        li.QuadPart = static_cast<LONGLONG>(a_at);
+        if (!SetFilePointerEx(m_handle, li, nullptr, FILE_BEGIN)) {
+            return false;
+        }
+        DWORD read = 0;
+        return ReadFile(m_handle, a_buf, a_size, &read, nullptr) && read == a_size;
     }
-    const auto fallback = std::filesystem::path(L"Data") / a_path.filename();
-    if (tryStat(fallback, stamp)) {
-        return stamp;
+
+    HANDLE m_handle;
+};
+
+// Flag semantics for probe-matchability, from the engine's FindCellInFile
+// slow scan (AE 1.6.1170, TESWorldSpace::FindCellInFile @ 0x1403064C0,
+// verified by disassembly):
+//   - The ONLY header flag the scan checks is 0x400. A CELL with 0x400 set
+//     is assigned coordinate INT_MAX (0x7FFFFFFF), which can never equal a
+//     target coord, so the engine NEVER matches a 0x400 CELL. Because our
+//     generation probe calls that same engine function, cellsFound never
+//     counts a 0x400 CELL either — so a 0x400 CELL belongs in NEITHER
+//     verification bound (excluded entirely).
+//   - The scan does NOT check 0x20 (deleted): a deleted CELL that still
+//     carries an XCLC subrecord IS matched by coordinate. We can't cheaply
+//     confirm the XCLC survived a deletion, and a zero-size CELL has no
+//     XCLC to match, so deleted-or-zero-size CELLs count as UNCERTAIN,
+//     widening only the upper bound of the band.
+constexpr std::uint32_t kRecFlagDeleted = 0x00000020;
+constexpr std::uint32_t kRecFlag400     = 0x00000400;
+
+// Counts CELL record headers inside exterior block/sub-block groups (type 4
+// and 5), recursing through nested groups; cell-children groups (type >= 6)
+// are skipped. A CELL directly inside the type-1 world-children group is the
+// world's PERSISTENT cell — tracked as a flag because the engine's slow-scan
+// probe at its XCLC (typically 0,0) can match it. a_depth caps recursion so
+// a crafted/corrupt plugin can't exhaust the game's stack. Returns false
+// only on structural corruption.
+[[nodiscard]] bool CountCellsInGroup(PluginReader& a_reader, std::uint64_t a_begin,
+                                     std::uint64_t a_end, std::int32_t a_groupType,
+                                     WorldCellCounts& a_out, int a_depth)
+{
+    if (a_depth > 8) {
+        return false;  // legit nesting is 2 (block → sub-block)
     }
-    return {};
+    std::uint64_t pos = a_begin;
+    while (pos + 24 <= a_end) {
+        RawHeader h{};
+        if (!a_reader.ReadHeader(pos, h)) {
+            return false;
+        }
+        if (h.sig == kSigGRUP) {
+            if (h.sizeField < 24 || pos + h.sizeField > a_end) {
+                return false;
+            }
+            const auto childType = static_cast<std::int32_t>(h.typeOrFormID);
+            // Recurse only into exterior block levels; skip cell-children etc.
+            if (childType == 4 || childType == 5) {
+                if (!CountCellsInGroup(a_reader, pos + 24, pos + h.sizeField,
+                                       childType, a_out, a_depth + 1)) {
+                    return false;
+                }
+            }
+            pos += h.sizeField;
+        } else {
+            const std::uint64_t recEnd = pos + 24 + h.sizeField;
+            if (recEnd > a_end) {
+                return false;
+            }
+            if (h.sig == kSigCELL) {
+                if (a_groupType == 4 || a_groupType == 5) {
+                    if ((h.labelOrFlags & kRecFlag400) != 0) {
+                        // Engine never matches this cell — count in neither
+                        // bound (see flag-semantics note above).
+                    } else if (h.sizeField > 0 &&
+                               (h.labelOrFlags & kRecFlagDeleted) == 0) {
+                        ++a_out.clean;
+                    } else {
+                        ++a_out.uncertain;  // deleted-with-data or zero-size
+                    }
+                } else if (a_groupType == 1 && h.sizeField > 0 &&
+                           (h.labelOrFlags & kRecFlag400) == 0) {
+                    a_out.persistent = true;
+                }
+            }
+            pos = recEnd;
+        }
+    }
+    return pos == a_end || pos + 24 > a_end;  // tolerate trailing padding < one header
+}
+
+[[nodiscard]] std::optional<PluginScan> ScanPlugin(const std::filesystem::path& a_path)
+{
+    HANDLE handle = CreateFileW(a_path.c_str(), GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+    LARGE_INTEGER sizeLi{};
+    if (!GetFileSizeEx(handle, &sizeLi) || sizeLi.QuadPart <= 24) {
+        CloseHandle(handle);
+        return std::nullopt;
+    }
+    const auto fileEnd = static_cast<std::uint64_t>(sizeLi.QuadPart);
+
+    PluginReader reader(handle);
+    PluginScan   scan{};
+    std::unordered_set<std::uint32_t> seenChildren;
+    bool         ok = true;
+
+    RawHeader tes4{};
+    if (!reader.ReadHeader(0, tes4) || tes4.sig != kSigTES4 ||
+        24ull + tes4.sizeField > fileEnd) {
+        // A TES4 dataSize overrunning the file must be a parse FAILURE, not a
+        // silently-successful empty scan.
+        CloseHandle(handle);
+        return std::nullopt;
+    }
+    std::uint64_t pos = 24ull + tes4.sizeField;
+
+    while (ok && pos + 24 <= fileEnd) {
+        RawHeader top{};
+        if (!reader.ReadHeader(pos, top)) {
+            ok = false;
+            break;
+        }
+        if (top.sig != kSigGRUP) {
+            // Stray top-level record (non-standard but harmless) — skip it.
+            const std::uint64_t recEnd = pos + 24 + top.sizeField;
+            if (recEnd > fileEnd) {
+                ok = false;
+                break;
+            }
+            pos = recEnd;
+            continue;
+        }
+        if (top.sizeField < 24 || pos + top.sizeField > fileEnd) {
+            ok = false;
+            break;
+        }
+        const std::uint64_t grpEnd = pos + top.sizeField;
+        if (top.labelOrFlags == kSigWRLD &&
+            static_cast<std::int32_t>(top.typeOrFormID) == 0) {
+            // Inside the WRLD top group: WRLD records interleaved with their
+            // type-1 world-children groups. Attribution is by the children
+            // group's own LABEL (which per the format IS the parent WRLD's
+            // formID) — NOT by adjacency to the last-seen WRLD record, so an
+            // orphaned or reordered children group (merge-tool output) can
+            // never be counted into the wrong world.
+            std::uint64_t p = pos + 24;
+            while (ok && p + 24 <= grpEnd) {
+                RawHeader h{};
+                if (!reader.ReadHeader(p, h)) {
+                    ok = false;
+                    break;
+                }
+                if (h.sig == kSigGRUP) {
+                    if (h.sizeField < 24 || p + h.sizeField > grpEnd) {
+                        ok = false;
+                        break;
+                    }
+                    if (static_cast<std::int32_t>(h.typeOrFormID) == 1) {
+                        const auto labelKey = h.labelOrFlags & 0x00FFFFFFu;
+                        WorldCellCounts counts{};
+                        if (!CountCellsInGroup(reader, p + 24, p + h.sizeField,
+                                               1, counts, 0)) {
+                            ok = false;
+                            break;
+                        }
+                        // Two children groups resolving to one key means two
+                        // WRLD entries collided on objectID (or a malformed
+                        // duplicate) — counts can't be attributed, flag it.
+                        if (!seenChildren.insert(labelKey).second) {
+                            scan.ambiguousWorlds.insert(labelKey);
+                        }
+                        auto& w = scan.worlds[labelKey];
+                        w.clean      += counts.clean;
+                        w.uncertain  += counts.uncertain;
+                        w.persistent  = w.persistent || counts.persistent;
+                    }
+                    p += h.sizeField;
+                } else {
+                    const std::uint64_t recEnd = p + 24 + h.sizeField;
+                    if (recEnd > grpEnd) {
+                        ok = false;
+                        break;
+                    }
+                    if (h.sig == kSigWRLD) {
+                        // Seed so a WRLD with no children group is a known
+                        // world with 0 cells (vs. "not in scan").
+                        (void)scan.worlds[h.typeOrFormID & 0x00FFFFFFu];
+                    }
+                    p = recEnd;
+                }
+            }
+        }
+        pos = grpEnd;
+    }
+
+    CloseHandle(handle);
+    if (!ok) {
+        return std::nullopt;
+    }
+    return scan;
 }
 
 // ── .fco cache file ─────────────────────────────────────────────────────────
@@ -176,7 +458,16 @@ constexpr std::uint32_t kCacheMagic    = 'FCOF';
 //     fast path (stat-only, no content read) on unchanged plugins. The
 //     content hash stays as the fallback when size/mtime don't match.
 //     Header layout changed → old caches invalidated.
-constexpr std::uint32_t kCacheVersion       = 4;
+// v5: bumped for three correctness fixes that can all change (or should
+//     invalidate) previously-cached tables: (1) WorldUnitsToCell now
+//     matches the engine's truncate semantics — v4 tables could be sized
+//     one row/column short of the engine's runtime grid; (2) tables are
+//     now verified against a raw scan of the plugin's exterior CELL
+//     records before caching — v4 caches may contain unverified partial
+//     or false-empty tables; (3) plugin identity is now resolved to a
+//     single physical path shared by stamp+hash — v4 headers could
+//     describe a different file than the engine loaded (USVFS duality).
+constexpr std::uint32_t kCacheVersion       = 5;
 constexpr std::uint32_t kCacheEmptySentinel = UINT32_MAX;
 
 struct CacheHeader
@@ -240,6 +531,13 @@ template <typename T>
     CacheHeader header{};
     if (!ReadPod(in, header) || header.magic != kCacheMagic ||
         header.version != kCacheVersion) {
+        return CacheLoadStatus::kBadMagic;
+    }
+
+    // fileHash == 0 is HashFile's failure sentinel, never a real digest. A
+    // header carrying it can't be validated (and a failing re-hash would also
+    // produce 0, vacuously "matching"), so treat it as invalid outright.
+    if (header.fileHash == 0) {
         return CacheLoadStatus::kBadMagic;
     }
 
@@ -347,15 +645,26 @@ template <typename T>
 // indicates corrupt OFFSET_DATA bounds (e.g. uninitialized floats).
 constexpr std::uint32_t kMaxReasonableTableSize = 4 * 1024 * 1024;
 
-// Convert worldspace-unit float to cell coord with floor semantics matching
-// the engine (see GetIndexForCellCoord decompile: integer-cast then >> 12).
+// Convert worldspace-unit float to cell coord EXACTLY like the engine does
+// (GetIndexForCellCoord decompile: integer-cast then arithmetic >> 12 — i.e.
+// truncate toward zero, then shift). We previously applied a floor correction
+// for negative fractional values; that made our grid differ from the engine's
+// by one row/column whenever a bound was negative, non-integral, and its
+// truncation was a multiple of 4096 (including everything in (-1, 0)) —
+// undersizing the table the engine later indexes WITHOUT a bounds check.
+// The clamp guards the (int) cast against garbage float bounds, which is UB
+// for values outside int range and could bypass the -524288 sentinel check.
 [[nodiscard]] std::int32_t WorldUnitsToCell(float a_value)
 {
-    const auto truncated = static_cast<std::int32_t>(a_value);
-    if (a_value - static_cast<float>(truncated) < 0.0f) {
-        return (truncated - 1) >> 12;
+    if (std::isnan(a_value)) {
+        // NaN passes straight through std::clamp (all comparisons false) and
+        // the (int) cast of NaN is UB. Map it to the engine's own "no cells"
+        // sentinel so the caller's bounds checks reject it.
+        return INT32_MIN >> 12;  // == -524288
     }
-    return truncated >> 12;
+    constexpr float kMaxExact = 2147483520.0f;  // largest float <= INT32_MAX
+    const float clamped = std::clamp(a_value, -kMaxExact, kMaxExact);
+    return static_cast<std::int32_t>(clamped) >> 12;
 }
 
 // Resolve <game install>/Data via the running .exe location instead of cwd.
@@ -372,9 +681,47 @@ constexpr std::uint32_t kMaxReasonableTableSize = 4 * 1024 * 1024;
     return root;
 }
 
+// Resolve the plugin's physical path ONCE per file; the stamp, the content
+// hash, and the verification scan must all describe the SAME file the ENGINE
+// parsed. The engine opens plugins via cwd-relative "Data\<name>", which is
+// what MO2/USVFS overlays virtualize — under Wabbajack "Stock Game" the
+// exe-relative ABSOLUTE form can resolve to a different (stock) file or
+// nothing (err=2 for ~500 plugins on one tester's setup). So: cwd-relative
+// first (engine truth), exe-relative absolute as the fallback for Skyrim VR
+// where MO2 leaves cwd pointing at the profile dir and the relative form
+// fails entirely.
 [[nodiscard]] std::filesystem::path PluginPath(const RE::TESFile* a_file)
 {
+    const auto rel = std::filesystem::path(L"Data") / std::string_view(a_file->fileName);
+    std::error_code ec;
+    if (std::filesystem::exists(rel, ec)) {
+        auto abs = std::filesystem::absolute(rel, ec);
+        return ec ? rel : abs;
+    }
     return DataRoot() / std::string_view(a_file->fileName);
+}
+
+// Cache file name: sanitized editor ID for human readability + the world's
+// objectID (low 24 bits — load-order independent for non-ESL-origin worlds)
+// for uniqueness. Guards GetFormEditorID() returning null/empty, and keeps
+// two same-named (or unnamed) worldspaces from colliding onto one .fco and
+// cross-loading each other's tables.
+[[nodiscard]] std::string SanitizeForFilename(const char* a_text)
+{
+    std::string out;
+    if (a_text) {
+        for (const char c : std::string_view(a_text)) {
+            const auto uc = static_cast<unsigned char>(c);
+            out += (std::isalnum(uc) || c == '_' || c == '-') ? c : '_';
+            if (out.size() >= 64) {
+                break;
+            }
+        }
+    }
+    if (out.empty()) {
+        out = "WORLD";
+    }
+    return out;
 }
 
 [[nodiscard]] std::filesystem::path CacheFileFor(
@@ -382,8 +729,16 @@ constexpr std::uint32_t kMaxReasonableTableSize = 4 * 1024 * 1024;
     const RE::TESFile*           a_file,
     const RE::TESWorldSpace*     a_world)
 {
+    // ESL-origin worlds: use only the load-order-stable low 12 bits (the
+    // low-24 form of an ESL runtime ID embeds the ESL slot index, which
+    // changes whenever light plugins are added/removed — that would orphan
+    // and regenerate every ESL-origin cache on any load-order change).
+    const auto fid = a_world->GetFormID();
+    const auto id  = ((fid >> 24) == 0xFEu) ? (fid & 0x00000FFFu)
+                                            : (fid & 0x00FFFFFFu);
     return a_root / std::string_view(a_file->fileName)
-                  / (std::string(a_world->GetFormEditorID()) + ".fco");
+                  / fmt::format("{}_{:06X}.fco",
+                                SanitizeForFilename(a_world->GetFormEditorID()), id);
 }
 
 // Mirrors Generate()'s bounds-validation. Returns the offsetCount (= number
@@ -425,8 +780,28 @@ constexpr std::uint32_t kMaxReasonableTableSize = 4 * 1024 * 1024;
 
 }  // namespace
 
+const PluginScan* LazyPluginScan::Get()
+{
+    if (!computed) {
+        value    = ScanPlugin(path);
+        computed = true;
+    }
+    return value.has_value() ? &*value : nullptr;
+}
+
 std::filesystem::path SkyrimGenerator::GetCacheRoot() const
 {
+    // Resolve with the SAME cwd-relative-first / exe-relative-fallback order
+    // as PluginPath, so under MO2/USVFS the cache is written into the
+    // virtualized (writable) Data overlay rather than possibly the read-only
+    // real game Data dir. Reads and writes both go through here, so it stays
+    // self-consistent regardless.
+    const auto rel = std::filesystem::path(L"Data") / kCacheDirName;
+    std::error_code ec;
+    if (std::filesystem::exists(std::filesystem::path(L"Data"), ec)) {
+        auto abs = std::filesystem::absolute(rel, ec);
+        return ec ? rel : abs;
+    }
     return DataRoot() / kCacheDirName;
 }
 
@@ -448,40 +823,26 @@ std::uint32_t* SkyrimGenerator::InstallEngineArray(std::span<const std::uint32_t
     return buf;
 }
 
-std::uint32_t SkyrimGenerator::Generate(RE::TESFile* a_ownerFile,
-                                        RE::TESFile* a_workerFile,
+std::uint32_t SkyrimGenerator::Generate(RE::TESFile* a_file,
                                         RE::TESWorldSpace* a_world,
                                         OFFSET_DATA* a_data,
                                         std::vector<std::uint32_t>& a_offsets)
 {
+    // Single source of truth for grid sizing (ComputeOffsetCount applies the
+    // exact same sentinel / inverted / >=1000 / GetIndexForCellCoord / sanity-
+    // cap checks); returns 0 on any rejection.
+    const auto offsetCount = ComputeOffsetCount(a_world, a_file, a_data);
+    if (offsetCount == 0) {
+        logger::warn("[{}/{}] invalid or unusable cell bounds — skipping "
+                     "(vanilla slow path keeps working)",
+                     a_file->fileName, a_world->GetFormEditorID());
+        return UINT32_MAX;
+    }
+
     const auto minX = WorldUnitsToCell(a_data->offsetMinCoords.x);
     const auto minY = WorldUnitsToCell(a_data->offsetMinCoords.y);
     const auto maxX = WorldUnitsToCell(a_data->offsetMaxCoords.x);
     const auto maxY = WorldUnitsToCell(a_data->offsetMaxCoords.y);
-
-    // No-cells sentinel from the engine — when bounds aren't initialized.
-    if (minX == -524288) {
-        return UINT32_MAX;
-    }
-
-    if (maxX < minX || maxY < minY ||
-        (maxX - minX + 1) >= 1000 || (maxY - minY + 1) >= 1000) {
-        logger::warn("[{}/{}] invalid cell bounds ({}, {}) — ({}, {}), skipping",
-                     a_ownerFile->fileName, a_world->GetFormEditorID(),
-                     minX, minY, maxX, maxY);
-        return UINT32_MAX;
-    }
-
-    const auto maxIdx = GetIndexForCellCoord(a_world, a_ownerFile, maxX, maxY);
-    if (maxIdx < 0) {
-        return UINT32_MAX;
-    }
-    const auto offsetCount = static_cast<std::uint32_t>(maxIdx) + 1;
-    if (offsetCount > kMaxReasonableTableSize) {
-        logger::warn("[{}/{}] table size {} exceeds sanity cap, skipping",
-                     a_ownerFile->fileName, a_world->GetFormEditorID(), offsetCount);
-        return UINT32_MAX;
-    }
 
     a_offsets.assign(offsetCount, 0);
 
@@ -489,22 +850,20 @@ std::uint32_t SkyrimGenerator::Generate(RE::TESFile* a_ownerFile,
     // thread is blocked until this returns and our worker threads each own a
     // unique TESFile via the atomic-index partition in Run(). Nothing else in
     // the engine can mutate `a_data->fileOffset` between this read and the end
-    // of the loop. Subtracting from a fixed base also produces identical
-    // entries to `a_workerFile->fileOffset - a_data->fileOffset` per-iteration,
-    // but is one load cheaper.
+    // of the loop.
     const auto baseFileOffset = a_data->fileOffset;
 
     std::uint32_t cellsFound = 0;
     for (std::int32_t y = minY; y <= maxY; ++y) {
         for (std::int32_t x = minX; x <= maxX; ++x) {
-            const auto idx = GetIndexForCellCoord(a_world, a_ownerFile, x, y);
+            const auto idx = GetIndexForCellCoord(a_world, a_file, x, y);
             if (idx < 0 || static_cast<std::uint32_t>(idx) >= offsetCount) {
                 continue;
             }
-            if (!FindCellInFile(a_world, a_workerFile, x, y)) {
+            if (!FindCellInFile(a_world, a_file, x, y)) {
                 continue;
             }
-            a_offsets[idx] = a_workerFile->fileOffset - baseFileOffset;
+            a_offsets[idx] = a_file->fileOffset - baseFileOffset;
             ++cellsFound;
         }
     }
@@ -512,10 +871,10 @@ std::uint32_t SkyrimGenerator::Generate(RE::TESFile* a_ownerFile,
     return cellsFound;
 }
 
-bool SkyrimGenerator::ProcessWorld(RE::TESFile* a_ownerFile,
-                                   RE::TESFile* a_workerFile,
+bool SkyrimGenerator::ProcessWorld(RE::TESFile* a_file,
                                    const FileStamp& a_stamp,
                                    LazyFileHash& a_fileHash,
+                                   LazyPluginScan& a_scan,
                                    RE::TESWorldSpace* a_world)
 {
     // Inline BSTHashMap::find at TESWorldSpace+0x1D0 — purely a read-only
@@ -524,7 +883,7 @@ bool SkyrimGenerator::ProcessWorld(RE::TESFile* a_ownerFile,
     // it at 0x1402B7AA0, not at REL_ID(20110)-0xC0), so the engine wrapper
     // is unsafe for the generator. The map at +0x1D0 has the same layout
     // across SE/AE/VR/GOG, so the inline lookup just works.
-    auto* data = FindOffsetData(a_world, a_ownerFile);
+    auto* data = FindOffsetData(a_world, a_file);
     if (!data) {
         // Plugin doesn't contribute anything to this worldspace.
         return false;
@@ -555,26 +914,38 @@ bool SkyrimGenerator::ProcessWorld(RE::TESFile* a_ownerFile,
         return true;
     };
 
-    const auto cachePath = CacheFileFor(GetCacheRoot(), a_ownerFile, a_world);
+    const auto cachePath = CacheFileFor(GetCacheRoot(), a_file, a_world);
 
     std::vector<std::uint32_t> offsets;
     const auto status = LoadCache(cachePath, a_stamp, a_fileHash, offsets);
-    switch (status) {
-    case CacheLoadStatus::kOk:
-        if (publish(offsets)) {
-            m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
-            return true;
+    if (status == CacheLoadStatus::kOk) {
+        // A cached table was verified at WRITE time, but its size must still
+        // fit the engine's CURRENT grid for this (file, world): the engine
+        // indexes pCellFileOffsets without a bounds check, so a stale or
+        // cross-linked cache of the wrong size becomes an out-of-bounds read.
+        const auto expected = ComputeOffsetCount(a_world, a_file, data);
+        if (expected != 0 && offsets.size() == expected) {
+            if (publish(offsets)) {
+                m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            logger::warn("[{}/{}] cache load OK but engine alloc failed",
+                         a_file->fileName, a_world->GetFormEditorID());
+        } else {
+            logger::warn("[{}/{}] cached table size {} != engine grid {} — "
+                         "discarding cache and regenerating",
+                         a_file->fileName, a_world->GetFormEditorID(),
+                         offsets.size(), expected);
         }
-        logger::warn("[{}/{}] cache load OK but engine alloc failed",
-                     a_ownerFile->fileName, a_world->GetFormEditorID());
-        break;
-    case CacheLoadStatus::kEmptyWorld:
+        // fall through to regeneration
+    } else if (status == CacheLoadStatus::kEmptyWorld) {
+        // Verified-empty at write time (raw scan found zero exterior CELL
+        // records for this world in this plugin).
         if (!Patches::HasSafeLookupPatch()) {
-            // Cached as empty, but our Load NOPs created OFFSET_DATA for this
-            // ESP → pCellFileOffsets is null. Without the original-style safe
-            // editor-ID lookup patch, we still need a zero-valued sentinel to
-            // keep the engine from null-dereferencing on `coc <editorID>`.
-            const auto offsetCount = ComputeOffsetCount(a_world, a_ownerFile, data);
+            // Without the original-style safe editor-ID lookup patch we still
+            // need a zero-valued sentinel so `coc <editorID>` can't null-deref
+            // the OFFSET_DATA our Load NOPs created.
+            const auto offsetCount = ComputeOffsetCount(a_world, a_file, data);
             if (offsetCount > 0) {
                 std::vector<std::uint32_t> zeros(offsetCount, 0);
                 if (publish(zeros)) {
@@ -584,42 +955,131 @@ bool SkyrimGenerator::ProcessWorld(RE::TESFile* a_ownerFile,
         }
         m_stats.emptyWorlds.fetch_add(1, std::memory_order_relaxed);
         return false;
-    default:
-        // Cache miss / mismatch / corrupt — regenerate.
-        break;
     }
+    // Cache miss / mismatch / corrupt / wrong-size — regenerate.
 
     // Real generation work (slow). Reveal the progress window — a pure cache /
     // OFST-intact launch never reaches here, so the window never flashes.
     ProgressWindow::NotifyGenerating();
 
-    const auto cellsFound = Generate(a_ownerFile, a_workerFile, a_world, data, offsets);
+    const auto cellsFound = Generate(a_file, a_world, data, offsets);
     if (cellsFound == UINT32_MAX) {
         // Bounds invalid — engine's GetIndexForCellCoord will reject all
         // (x, y) here too (or the slow path keeps working), so the unsafe
         // deref site can never fire.
         return false;
     }
+
+    // ── Verification gate ───────────────────────────────────────────────────
+    // The engine treats a zero table entry as "cell not in this file" with NO
+    // slow-path fallback, so publishing (or caching) a table with gaps turns
+    // any generation miss into permanently missing cell content. Before
+    // trusting the probe results, compare cellsFound against the number of
+    // exterior CELL records the plugin ACTUALLY contains for this world (raw
+    // header-only scan of the file's GRUP structure). Mismatch or unparsable
+    // file ⇒ leave pCellFileOffsets null: the engine's slow path stays intact
+    // (correct, just unaccelerated) and NOTHING is cached, so a transient IO
+    // failure can never be baked in.
+    const auto* scan = a_scan.Get();
+    if (!scan) {
+        logger::warn("[{}/{}] plugin structure scan failed — table not "
+                     "published or cached (engine slow path preserved)",
+                     a_file->fileName, a_world->GetFormEditorID());
+        m_stats.scanFailed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // Map the runtime worldspace to its in-file objectID. Non-ESL-origin
+    // worlds keep their low 24 bits in every override record; ESL-origin
+    // worlds (runtime 0xFExxxxxx) store only the low 12 bits in-file — for
+    // those the low-24 runtime key contains ESL slot bits and would only
+    // ever match a DIFFERENT world's key by collision, so use low-12 alone.
+    const auto runtimeID = a_world->GetFormID();
+    const auto key       = ((runtimeID >> 24) == 0xFEu) ? (runtimeID & 0x00000FFFu)
+                                                        : (runtimeID & 0x00FFFFFFu);
+    const auto it        = scan->worlds.find(key);
+
+    if (it == scan->worlds.end()) {
+        // The engine says this file contributes OFFSET_DATA to this world,
+        // but the scan found no WRLD record for it — the two views disagree,
+        // so the scan can't vouch for anything (treating this as rawCount==0
+        // could cache a FALSE empty). Inconclusive ⇒ no publish, no cache.
+        logger::warn("[{}/{}] world not found in plugin scan (key {:06X}) — "
+                     "table not published or cached",
+                     a_file->fileName, a_world->GetFormEditorID(), key);
+        m_stats.scanFailed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const auto& raw = it->second;
+
+    if (scan->ambiguousWorlds.contains(key)) {
+        logger::warn("[{}/{}] plugin contains duplicate WRLD groups for this "
+                     "world — table not published or cached",
+                     a_file->fileName, a_world->GetFormEditorID());
+        m_stats.scanFailed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // Verification band. Lower bound: cells the engine's probe definitely
+    // matches (clean records with data). Upper bound additionally allows
+    // records whose matchability depends on unverified engine flag
+    // semantics (deleted/0x400/zero-size — 'uncertain'), plus one hit for
+    // the persistent CELL when the probed grid contains the origin. The
+    // generation probe itself defines runtime semantics, so any count
+    // inside the band is explainable by static file content; a count
+    // outside it means something non-static (transient IO failure,
+    // bounds narrower than content) happened — keep the slow path.
+    const bool originInBounds =
+        WorldUnitsToCell(data->offsetMinCoords.x) <= 0 &&
+        WorldUnitsToCell(data->offsetMinCoords.y) <= 0 &&
+        WorldUnitsToCell(data->offsetMaxCoords.x) >= 0 &&
+        WorldUnitsToCell(data->offsetMaxCoords.y) >= 0;
+    const auto slack = (originInBounds && raw.persistent) ? 1u : 0u;
+    const auto lower = raw.clean;
+    const auto upper = raw.clean + raw.uncertain + slack;
+
+    if (cellsFound < lower || cellsFound > upper) {
+        logger::warn("[{}/{}] verification mismatch: probes found {} cells, "
+                     "file contains {} (+{} uncertain, +{} slack) — table "
+                     "not published or cached (engine slow path preserved)",
+                     a_file->fileName, a_world->GetFormEditorID(),
+                     cellsFound, raw.clean, raw.uncertain, slack);
+        m_stats.mismatched.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    // Never persist a cache entry we can't key: fileHash 0 means the plugin
+    // could not be (fully) read for hashing, so the entry would be
+    // unverifiable on later boots (0 == 0 vacuous match).
+    const auto fileHash  = a_fileHash.Get();
+    const bool cacheable = fileHash != 0;
+
     if (cellsFound == 0) {
-        // Worldspace exists in this plugin but contributes no exterior cells.
-        // With the original-style safe lookup patch installed, null
-        // pCellFileOffsets is fine here; otherwise keep the older sentinel
-        // fallback.
+        // VERIFIED empty: the raw scan agrees this plugin contributes no
+        // exterior cells to this worldspace.
         if (!Patches::HasSafeLookupPatch() && publish(offsets)) {
             m_stats.emptySentinels.fetch_add(1, std::memory_order_relaxed);
         }
-        std::ignore = SaveCache(cachePath, a_fileHash.Get(), a_stamp, {});
+        if (cacheable && !SaveCache(cachePath, fileHash, a_stamp, {})) {
+            logger::warn("[{}/{}] failed to write cache file '{}'",
+                         a_file->fileName, a_world->GetFormEditorID(),
+                         cachePath.string());
+        }
         m_stats.emptyWorlds.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
     if (publish(offsets)) {
-        std::ignore = SaveCache(cachePath, a_fileHash.Get(), a_stamp, offsets);
+        if (cacheable && !SaveCache(cachePath, fileHash, a_stamp, offsets)) {
+            logger::warn("[{}/{}] failed to write cache file '{}'",
+                         a_file->fileName, a_world->GetFormEditorID(),
+                         cachePath.string());
+        }
         m_stats.generatedTables.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     logger::warn("[{}/{}] generated {} cells but engine alloc failed",
-                 a_ownerFile->fileName, a_world->GetFormEditorID(), cellsFound);
+                 a_file->fileName, a_world->GetFormEditorID(), cellsFound);
     return false;
 }
 
@@ -676,6 +1136,16 @@ void SkyrimGenerator::Run()
     for (auto& [file, list] : work) {
         targets.emplace_back(file, std::move(list));
     }
+    // Largest-file-first, matching WallSoGB's NVSE original
+    // (CellOffsetGenerator.cpp:445-448) and the Starfield port: with the
+    // work-stealing atomic index, handing out the biggest plugins first keeps
+    // a slow file from becoming the lone straggler while every other worker
+    // idles. TESFile::filesize (+0x2A4) is the engine's own size field — the
+    // same one Wall sorts on — so no filesystem stat is needed.
+    std::sort(targets.begin(), targets.end(),
+              [](const auto& a, const auto& b) {
+                  return a.first->filesize > b.first->filesize;
+              });
     m_stats.totalFiles.store(static_cast<std::uint32_t>(targets.size()),
                              std::memory_order_relaxed);
 
@@ -701,6 +1171,7 @@ void SkyrimGenerator::Run()
 
     std::atomic<std::size_t> nextIdx{ 0 };
     auto worker = [&]() {
+        SetThreadDescription(GetCurrentThread(), L"FCL Generator Worker");
         while (true) {
             const auto i = nextIdx.fetch_add(1, std::memory_order_relaxed);
             if (i >= targets.size()) {
@@ -708,25 +1179,42 @@ void SkyrimGenerator::Run()
             }
             auto* file       = targets[i].first;
             const auto& needy = targets[i].second;
-            const auto pluginPath = PluginPath(file);
 
-            // Cheap identity for the cache fast-path. The content hash is
-            // computed lazily by LazyFileHash only if a cache stamp misses or
-            // we generate a fresh table — so an all-cache-hit launch reads no
-            // plugin bytes at all.
-            const auto   stamp = StatPlugin(pluginPath);
-            LazyFileHash fileHash{ pluginPath };
-            if (!stamp.valid) {
-                logger::warn("Generator: failed to stat {} (path='{}', err={}); "
-                             "falling back to content hash",
-                             file->fileName, pluginPath.string(), GetLastError());
-            }
+            // Exception barrier: a throw escaping a jthread calls
+            // std::terminate → CTD during the loading screen. Anything below
+            // (filesystem paths from plugin-controlled names, allocation,
+            // logging) may throw; contain it to this file and move on — the
+            // affected plugin just keeps the engine's slow path.
+            try {
+                // One resolved path per file: stamp, hash, and verification
+                // scan all describe the same physical file (see PluginPath).
+                const auto pluginPath = PluginPath(file);
 
-            for (auto* world : needy) {
-                if (world) {
-                    ProcessWorld(file, file, stamp, fileHash, world);
+                // Cheap identity for the cache fast-path. Content hash and
+                // structure scan are lazy — an all-cache-hit launch reads no
+                // plugin bytes at all.
+                std::uint32_t statError = 0;
+                const auto    stamp     = StatPlugin(pluginPath, &statError);
+                LazyFileHash   fileHash{ pluginPath };
+                LazyPluginScan scan{ pluginPath };
+                if (!stamp.valid) {
+                    logger::warn("Generator: failed to stat {} (path='{}', err={}); "
+                                 "falling back to content hash",
+                                 file->fileName, pluginPath.string(), statError);
                 }
-                ProgressWindow::Tick();  // one (file, world) work unit done
+
+                for (auto* world : needy) {
+                    if (world) {
+                        ProcessWorld(file, stamp, fileHash, scan, world);
+                    }
+                    ProgressWindow::Tick();  // one (file, world) work unit done
+                }
+            } catch (const std::exception& e) {
+                logger::error("Generator: worker exception on '{}': {}",
+                              file ? file->fileName : "<null>", e.what());
+            } catch (...) {
+                logger::error("Generator: unknown worker exception on '{}'",
+                              file ? file->fileName : "<null>");
             }
             m_stats.processedFiles.fetch_add(1, std::memory_order_relaxed);
         }
@@ -740,6 +1228,12 @@ void SkyrimGenerator::Run()
     for (const auto& entry : targets) {
         totalWork += static_cast<std::uint32_t>(entry.second.size());
     }
+    // RAII pairing: if anything below throws, the window thread must not be
+    // orphaned re-asserting topmost over the game for the whole session.
+    struct ProgressScope
+    {
+        ~ProgressScope() { ProgressWindow::Stop(); }
+    } progressScope;
     ProgressWindow::Start("FasterCellLookup");
     ProgressWindow::SetTotal(totalWork);
 
@@ -762,15 +1256,28 @@ void SkyrimGenerator::Run()
                              .count();
 
     logger::info(
-        "Generator: done in {} ms — files={}, generated={}, cache-hits={}, "
-        "OFST-intact={}, empty-worlds={} (sentinels={})",
+        "Generator: done in {} ms — files={}/{}, generated={}, "
+        "cache-hits={}, OFST-intact={}, empty-worlds={} (sentinels={}), "
+        "verify-mismatch={}, scan-failed={}",
         elapsed,
         m_stats.processedFiles.load(),
+        m_stats.totalFiles.load(),
         m_stats.generatedTables.load(),
         m_stats.cacheHits.load(),
         m_stats.ofstIntact.load(),
         m_stats.emptyWorlds.load(),
-        m_stats.emptySentinels.load());
+        m_stats.emptySentinels.load(),
+        m_stats.mismatched.load(),
+        m_stats.scanFailed.load());
+    if (m_stats.mismatched.load() > 0 || m_stats.scanFailed.load() > 0) {
+        logger::warn(
+            "Generator: {} worldspace table(s) were NOT accelerated because "
+            "the plugin's actual cell records did not match the probe results "
+            "(or the plugin could not be parsed). Those plugins keep the "
+            "vanilla slow path — content is safe, just not sped up. See "
+            "warnings above for the specific plugins.",
+            m_stats.mismatched.load() + m_stats.scanFailed.load());
+    }
 }
 
 }  // namespace cog

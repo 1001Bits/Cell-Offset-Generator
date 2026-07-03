@@ -20,10 +20,12 @@ struct EngineFunc
 };
 
 // IDs verified against versionlib-1-6-1170-0.bin (AE) and version-1-5-97-0.bin
-// (SE); VR + GOG offsets verified via Ghidra.
+// (SE); VR + GOG offsets verified via Ghidra. These are the only two engine
+// functions the generator uses — the same delegation surface as WallSoGB's
+// NVSE probe loop (FindCellInFile + GetIndexForCellCoord). OFFSET_DATA lookup
+// is an inline BSTHashMap::find (EngineTypes.h), not an engine call.
 constexpr EngineFunc kFindCellInFile       { 20022, 20456, 0x2C32D0, 0x3062F0 };
 constexpr EngineFunc kGetIndexForCellCoord { 20023, 20457, 0x2C3560, 0x306580 };
-constexpr EngineFunc kGetOrCreateOffsetData{ 20110, 20560, 0x2C92D0, 0x30C8B0 };
 
 [[nodiscard]] std::uintptr_t Resolve(const EngineFunc& a_func)
 {
@@ -40,9 +42,8 @@ constexpr EngineFunc kGetOrCreateOffsetData{ 20110, 20560, 0x2C92D0, 0x30C8B0 };
     return REL::RelocationID(a_func.seID, a_func.aeID).address();
 }
 
-using FindCellInFile_t        = bool (*)(RE::TESWorldSpace*, RE::TESFile*, std::int32_t, std::int32_t);
-using GetIndexForCellCoord_t  = std::int32_t (*)(RE::TESWorldSpace*, RE::TESFile*, std::int32_t, std::int32_t);
-using GetOrCreateOffsetData_t = OFFSET_DATA* (*)(RE::TESWorldSpace*, RE::TESFile*);
+using FindCellInFile_t       = bool (*)(RE::TESWorldSpace*, RE::TESFile*, std::int32_t, std::int32_t);
+using GetIndexForCellCoord_t = std::int32_t (*)(RE::TESWorldSpace*, RE::TESFile*, std::int32_t, std::int32_t);
 
 }  // namespace
 
@@ -64,15 +65,6 @@ std::int32_t GetIndexForCellCoord(RE::TESWorldSpace* a_world, RE::TESFile* a_fil
         return -1;
     }
     return reinterpret_cast<GetIndexForCellCoord_t>(addr)(a_world, a_file, a_x, a_y);
-}
-
-OFFSET_DATA* GetOrCreateOffsetData(RE::TESWorldSpace* a_world, RE::TESFile* a_file)
-{
-    static const auto addr = Resolve(kGetOrCreateOffsetData);
-    if (addr == 0) {
-        return nullptr;
-    }
-    return reinterpret_cast<GetOrCreateOffsetData_t>(addr)(a_world, a_file);
 }
 
 bool RuntimeHasEngineAddresses()

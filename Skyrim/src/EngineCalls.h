@@ -29,10 +29,4 @@ namespace cog {
                                                 RE::TESFile* a_file,
                                                 std::int32_t a_x, std::int32_t a_y);
 
-// TESWorldSpace::GetOrCreateOffsetData @ 0x14030CA80
-// Returns the OFFSET_DATA* for (world, file), inserting an empty entry if
-// missing. Always non-null.
-[[nodiscard]] OFFSET_DATA* GetOrCreateOffsetData(RE::TESWorldSpace* a_world,
-                                                 RE::TESFile* a_file);
-
 }  // namespace cog

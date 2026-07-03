@@ -16,6 +16,9 @@ struct Settings
 {
     bool enablePatches{ true };
     bool findCellInFileLogging{ false };
+    // First-run generation progress window (Win32 overlay). Off = generation
+    // still runs, just without the on-screen bar.
+    bool showProgressWindow{ true };
 
     // Internal — always true when enablePatches=true. Kept as fields so the
     // patch-install code can reference them; not exposed in the INI.

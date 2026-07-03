@@ -7,6 +7,7 @@
 #include "FindCellInFileTimer.h"
 #include "Patches.h"
 #include "PhaseTimer.h"
+#include "ProgressWindow.h"
 #include "Settings.h"
 #include "SkyrimGenerator.h"
 
@@ -127,13 +128,27 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
     const auto ver = REL::Module::get().version();
     logger::info("Detected Skyrim{} v{}", REL::Module::IsVR() ? " VR" : "", ver.string());
 
-    // INI lives next to the DLL: Data/SKSE/Plugins/<name>.ini
-    const auto iniPath = std::filesystem::path("Data/SKSE/Plugins") /
-                         fmt::format("{}.ini", plugin->GetName());
+    // INI lives next to the DLL: Data/SKSE/Plugins/<name>.ini. Resolve it the
+    // same way we resolve plugins: cwd-relative first (the path MO2's USVFS
+    // virtualizes), exe-relative absolute as the fallback for the Skyrim VR +
+    // MO2 case where cwd points at the profile dir. Settings::Load makes the
+    // final path absolute — GetPrivateProfileIntW resolves non-fully-qualified
+    // paths against the Windows directory, not the cwd.
+    const auto iniName = fmt::format("{}.ini", plugin->GetName());
+    auto iniPath = std::filesystem::path("Data/SKSE/Plugins") / iniName;
+    std::error_code iniEc;
+    if (!std::filesystem::exists(iniPath, iniEc)) {
+        wchar_t exeBuf[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exeBuf, MAX_PATH);
+        iniPath = std::filesystem::path(exeBuf).parent_path() /
+                  L"Data" / L"SKSE" / L"Plugins" / iniName;
+    }
     g_settings = cog::Settings::Load(iniPath);
     cog::PhaseTimer::SetVerboseCellLogging(g_settings.findCellInFileLogging);
-    logger::info("Settings: enable-patches={}, find-cell-logging={}",
-                 g_settings.enablePatches, g_settings.findCellInFileLogging);
+    cog::ProgressWindow::SetEnabled(g_settings.showProgressWindow);
+    logger::info("Settings: enable-patches={}, find-cell-logging={}, progress-window={}",
+                 g_settings.enablePatches, g_settings.findCellInFileLogging,
+                 g_settings.showProgressWindow);
 
     const auto messaging = SKSE::GetMessagingInterface();
     if (!messaging || !messaging->RegisterListener(MessageHandler)) {
@@ -146,11 +161,20 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
     if (!cog::Patches::InitHooks(g_settings)) {
         logger::warn("Patches not fully applied — see log for details");
     }
-    if (cog::RuntimeHasEngineAddresses()) {
-        (void)cog::FindCellInFileTimer::InitHooks();
+
+    // Timing instrumentation is OFF by default (Wall ships none). It exists
+    // for benchmarking and support diagnostics and installs ONLY when
+    // FindCellInFileLogging=1 — so a normal EnablePatches=1 install touches
+    // exactly the engine surface the optimization needs (the 7 NOPs +
+    // SafeLookupPatch) and nothing else, and EnablePatches=0 is fully vanilla.
+    if (g_settings.findCellInFileLogging) {
+        if (cog::RuntimeHasEngineAddresses()) {
+            (void)cog::FindCellInFileTimer::InitHooks();
+        }
+        (void)cog::CellFindInFileFastTimer::InitHooks();
+        (void)cog::CellLoadTimer::InitHooks();
+        logger::info("Instrumentation: timing hooks installed (FindCellInFileLogging=1)");
     }
-    (void)cog::CellFindInFileFastTimer::InitHooks();
-    (void)cog::CellLoadTimer::InitHooks();
 
     logger::info("{} loaded", plugin->GetName());
     return true;

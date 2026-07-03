@@ -21,6 +21,9 @@ namespace cog {
 class ProgressWindow
 {
 public:
+    // Master switch ([Progress] ShowProgressWindow). When disabled, Start is
+    // a no-op and every other call safely does nothing.
+    static void SetEnabled(bool a_enabled);
     static void Start(const char* a_title);
     static void SetTotal(std::uint32_t a_total);
     static void NotifyGenerating();  // first real (cache-miss) generation → reveal

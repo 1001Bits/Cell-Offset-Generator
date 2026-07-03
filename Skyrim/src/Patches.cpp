@@ -19,54 +19,6 @@ struct EngineFunc
     std::uintptr_t gogOffset;
 };
 
-constexpr EngineFunc kFindCellInFileEntry    { 20022, 20456, 0x2C32D0, 0x3062F0 };
-constexpr EngineFunc kGetOrCreateOffsetData  { 20110, 20560, 0x2C92D0, 0x30C8B0 };
-constexpr EngineFunc kGetExtCellDataByEditorID{ 13618, 13716, 0x17C000, 0 };
-constexpr std::ptrdiff_t kFindCellByEditorIDDeltaFromFindCellInFile = 0x900;
-constexpr std::ptrdiff_t kFindCellByEditorIDDeltaFromFindCellInFileVR = 0x910;
-// GetOffsetData sits a fixed delta before GetOrCreateOffsetData on AE/VR/GOG
-// (function spacing = -0xC0 there) but on SE 1.5.97 the delta is -0xB0 — the
-// function bodies are smaller. The DiscoverCallSiteByScan() fallback below
-// uses these per-runtime deltas to derive GetOffsetData when the hardcoded
-// call-site table is missing an entry; for SE/AE/VR/GOG the table fires
-// first so the scan path is rarely exercised, but we still keep the delta
-// correct per runtime so unknown future patches don't compute a garbage
-// scan target.
-constexpr std::ptrdiff_t kGetOffsetDataDeltaSE  = -0xB0;
-constexpr std::ptrdiff_t kGetOffsetDataDeltaAE  = -0xC0;
-constexpr std::ptrdiff_t kGetOffsetDataDeltaVR  = -0xC0;
-constexpr std::ptrdiff_t kGetOffsetDataDeltaGOG = -0xC0;
-constexpr std::size_t kLookupScanBytes = 0x120;
-constexpr std::size_t kCallerScanBytes = 0x420;
-constexpr std::uintptr_t kMaxModuleScanSpan = 0x08000000;
-
-// Hardcoded RVA of the `CALL <GetOffsetData>` E8 byte inside the editor-ID
-// cell-lookup helper, per runtime. WallSoGB's NVSE original hardcoded the
-// equivalent at 0x58598F (single fixed call site); we follow the same
-// pattern so the patch stops depending on a heuristic byte-pattern scan.
-//
-// 0 = unverified — the scan-based DiscoverCallSiteByScan() below is used
-// instead, and logs the discovered RVA so it can be pasted in here.
-//
-// Verify in Ghidra: open the runtime's project, navigate to the editor-ID
-// cell lookup helper (called by TESDataHandler::GetExtCellDataFromFileByEditorID),
-// find the single CALL <TESWorldSpace::GetOffsetData>, record the RVA of the
-// E8 byte. AE 1.6.1170 reference: GetOffsetData @ 0x14030C9C0,
-// GetOrCreateOffsetData @ 0x14030CA80 (delta +0xC0).
-struct SafeLookupCallSiteRVA
-{
-    std::uintptr_t se;
-    std::uintptr_t ae;
-    std::uintptr_t vr;
-    std::uintptr_t gog;
-};
-constexpr SafeLookupCallSiteRVA kSafeLookupCallSiteRVA{
-    .se  = 0x2B2520,  // SE 1.5.97 — verified in SkyrimSE.gpr (helper @ 0x1402b2470, CALL @ 0x1402b2520)
-    .ae  = 0x306E70,  // AE 1.6.1170 — verified in SkyrimSE.gpr (helper @ 0x140306dc0, CALL @ 0x140306e70)
-    .vr  = 0x2C3C90,  // VR 1.4.15 — verified in skyrimvr.gpr (helper @ 0x1402c3be0, CALL @ 0x1402c3c90)
-    .gog = 0x306CA0,  // GOG 1.6.1179 — verified in GOG SkyrimSE.gpr (helper @ 0x140306bf0, CALL @ 0x140306ca0)
-};
-
 [[nodiscard]] std::uintptr_t Resolve(const EngineFunc& a_func)
 {
     if (REL::Module::IsVR()) {
@@ -82,25 +34,17 @@ constexpr SafeLookupCallSiteRVA kSafeLookupCallSiteRVA{
     return REL::RelocationID(a_func.seID, a_func.aeID).address();
 }
 
-[[nodiscard]] std::ptrdiff_t GetFindCellByEditorIDDelta() noexcept
-{
-    return REL::Module::IsVR()
-             ? kFindCellByEditorIDDeltaFromFindCellInFileVR
-             : kFindCellByEditorIDDeltaFromFindCellInFile;
-}
-
 [[nodiscard]] OFFSET_DATA* GetOffsetDataSafe(RE::TESWorldSpace* a_world, RE::TESFile* a_file)
 {
-    // Inline BSTHashMap::find at TESWorldSpace+0x1D0. We previously used the
-    // engine's GetOffsetData (= GetOrCreateOffsetData - 0xC0), but the delta
-    // is per-runtime (SE 1.5.97 has it at -0xB0, AE/VR at -0xC0). Mismatched
-    // delta jumps the engine call into garbage. The inline lookup matches
-    // the same map the engine reads, with no engine-address dependency. The
-    // engine's GetOffsetData also walks GetLastParent before the lookup;
-    // we skip that here because by the time the EDID-lookup helper reaches
-    // the call we trampoline, the file argument has already been resolved
-    // to the right plugin — the parent walk inside the engine call was
-    // defense-in-depth, not load-bearing.
+    // Inline BSTHashMap::find at TESWorldSpace+0x1D0. The engine's own
+    // GetOffsetData has no resolvable Address Library ID (only
+    // GetOrCreateOffsetData does), and deriving it by a fixed delta from
+    // GetOrCreate is per-runtime (SE 1.5.97 −0xB0, AE/VR/GOG −0xC0) — a wrong
+    // delta jumps into garbage. The inline lookup reads the same map with no
+    // engine-address dependency. The engine's GetOffsetData also walks
+    // GetLastParent first; we skip it because at this call site the file
+    // argument is already the resolved plugin — the parent walk was defense-
+    // in-depth, not load-bearing.
     auto* data = FindOffsetData(a_world, a_file);
     if (data && data->pCellFileOffsets) {
         return data;
@@ -108,64 +52,26 @@ constexpr SafeLookupCallSiteRVA kSafeLookupCallSiteRVA{
     return nullptr;
 }
 
-[[nodiscard]] bool IsLikelyModuleAddress(std::uintptr_t a_address) noexcept
+// Hardcoded RVA of the `CALL <GetOffsetData>` E8 byte inside the editor-ID
+// cell-lookup helper, per runtime — WallSoGB's NVSE original hardcodes the
+// equivalent single call site at 0x58598F. Verify in Ghidra: from
+// TESDataHandler::GetExtCellDataFromFileByEditorID find the editor-ID cell
+// lookup helper, locate its single CALL <TESWorldSpace::GetOffsetData>, and
+// record the RVA of the E8 byte. 0 disables the patch for that runtime (the
+// empty-world zero sentinel in the generator then covers the null-deref).
+struct SafeLookupCallSiteRVA
 {
-    const auto base = REL::Module::get().base();
-    return a_address >= base && a_address < (base + kMaxModuleScanSpan);
-}
-
-[[nodiscard]] std::size_t FindCallsToTarget(std::uintptr_t a_function,
-                                            std::size_t a_scanBytes,
-                                            std::uintptr_t a_target,
-                                            std::uintptr_t* a_firstCallSite = nullptr)
-{
-    const auto* fnBytes = reinterpret_cast<const std::uint8_t*>(a_function);
-    std::size_t matches = 0;
-    for (std::size_t i = 0; i + 5 <= a_scanBytes; ++i) {
-        if (fnBytes[i] != 0xE8) {
-            continue;
-        }
-        std::int32_t disp = 0;
-        std::memcpy(&disp, fnBytes + i + 1, sizeof(disp));
-        const auto target = static_cast<std::uintptr_t>(
-            static_cast<std::intptr_t>(a_function + i + 5) + disp);
-        if (target == a_target) {
-            if (matches == 0 && a_firstCallSite) {
-                *a_firstCallSite = a_function + i;
-            }
-            ++matches;
-        }
-    }
-    return matches;
-}
-
-[[nodiscard]] std::uintptr_t FindHelperViaGetExtCellData(std::uintptr_t a_getExtCellData,
-                                                         std::uintptr_t a_getOffsetData)
-{
-    const auto* fnBytes = reinterpret_cast<const std::uint8_t*>(a_getExtCellData);
-
-    std::uintptr_t helper = 0;
-    std::size_t helperMatches = 0;
-    for (std::size_t i = 0; i + 5 <= kCallerScanBytes; ++i) {
-        if (fnBytes[i] != 0xE8) {
-            continue;
-        }
-        std::int32_t disp = 0;
-        std::memcpy(&disp, fnBytes + i + 1, sizeof(disp));
-        const auto callee = static_cast<std::uintptr_t>(
-            static_cast<std::intptr_t>(a_getExtCellData + i + 5) + disp);
-        if (!IsLikelyModuleAddress(callee)) {
-            continue;
-        }
-
-        if (FindCallsToTarget(callee, kLookupScanBytes, a_getOffsetData) == 1) {
-            helper = callee;
-            ++helperMatches;
-        }
-    }
-
-    return helperMatches == 1 ? helper : 0;
-}
+    std::uintptr_t se;
+    std::uintptr_t ae;
+    std::uintptr_t vr;
+    std::uintptr_t gog;
+};
+constexpr SafeLookupCallSiteRVA kSafeLookupCallSiteRVA{
+    .se  = 0x2B2520,  // SE 1.5.97 — verified in SkyrimSE.gpr (helper @ 0x1402b2470, CALL @ 0x1402b2520)
+    .ae  = 0x306E70,  // AE 1.6.1170 — verified in SkyrimSE.gpr (helper @ 0x140306dc0, CALL @ 0x140306e70)
+    .vr  = 0x2C3C90,  // VR 1.4.15 — verified in skyrimvr.gpr (helper @ 0x1402c3be0, CALL @ 0x1402c3c90)
+    .gog = 0x306CA0,  // GOG 1.6.1179 — verified in GOG SkyrimSE.gpr (helper @ 0x140306bf0, CALL @ 0x140306ca0)
+};
 
 [[nodiscard]] std::uintptr_t PickHardcodedCallSite()
 {
@@ -183,80 +89,33 @@ constexpr SafeLookupCallSiteRVA kSafeLookupCallSiteRVA{
     return rva == 0 ? 0 : (mod.base() + rva);
 }
 
-[[nodiscard]] std::ptrdiff_t GetOffsetDataDelta() noexcept
-{
-    if (REL::Module::IsVR()) {
-        return kGetOffsetDataDeltaVR;
-    }
-    if (IsGOG()) {
-        return kGetOffsetDataDeltaGOG;
-    }
-    constexpr REL::Version kSE{ 1, 5, 97, 0 };
-    return REL::Module::get().version() == kSE
-             ? kGetOffsetDataDeltaSE
-             : kGetOffsetDataDeltaAE;
-}
-
-[[nodiscard]] std::uintptr_t DiscoverCallSiteByScan()
-{
-    const auto getOrCreate = Resolve(kGetOrCreateOffsetData);
-    if (getOrCreate == 0) {
-        logger::warn("SafeLookupPatch: missing GetOrCreateOffsetData address");
-        return 0;
-    }
-
-    const auto getOffsetData =
-        static_cast<std::uintptr_t>(static_cast<std::intptr_t>(getOrCreate) +
-                                    GetOffsetDataDelta());
-
-    std::uintptr_t targetFunc = 0;
-    const auto getExtCellData = Resolve(kGetExtCellDataByEditorID);
-    if (getExtCellData != 0) {
-        targetFunc = FindHelperViaGetExtCellData(getExtCellData, getOffsetData);
-    }
-    if (targetFunc == 0) {
-        const auto findCellInFile = Resolve(kFindCellInFileEntry);
-        if (findCellInFile == 0) {
-            logger::warn("SafeLookupPatch: scan failed — no helper-discovery anchor available");
-            return 0;
-        }
-        targetFunc = static_cast<std::uintptr_t>(
-            static_cast<std::intptr_t>(findCellInFile) +
-            GetFindCellByEditorIDDelta());
-    }
-
-    std::uintptr_t callSite = 0;
-    const auto matches = FindCallsToTarget(targetFunc, kLookupScanBytes, getOffsetData, &callSite);
-    if (matches != 1) {
-        logger::warn("SafeLookupPatch: scan found {} GetOffsetData calls in helper at +{:X}, expected 1",
-                     matches, targetFunc - REL::Module::get().base());
-        return 0;
-    }
-    return callSite;
-}
-
 [[nodiscard]] bool InstallSafeLookupPatch()
 {
-    auto callSite = PickHardcodedCallSite();
-    const bool fromTable = (callSite != 0);
-    if (!fromTable) {
-        callSite = DiscoverCallSiteByScan();
-        if (callSite == 0) {
-            return false;
-        }
+    const auto callSite = PickHardcodedCallSite();
+    if (callSite == 0) {
+        logger::warn("SafeLookupPatch: no verified call site for this runtime — "
+                     "editor-ID lookup patch skipped (empty-world sentinel covers it)");
+        return false;
+    }
+
+    // Byte-verify the site like every NOP site: the instruction we replace
+    // must be a rel32 CALL (E8). A mismatch means the binary differs from our
+    // table (another mod patched it, or an unexpected build) — log and skip
+    // rather than redirect a non-call. The generator's empty-world zero
+    // sentinel then keeps `coc <editorID>` from null-dereferencing.
+    if (*reinterpret_cast<const std::uint8_t*>(callSite) != 0xE8) {
+        logger::warn("SafeLookupPatch: expected E8 at +{:X}, found {:02X} — "
+                     "editor-ID lookup patch skipped (empty-world sentinel covers it)",
+                     callSite - REL::Module::get().base(),
+                     *reinterpret_cast<const std::uint8_t*>(callSite));
+        return false;
     }
 
     auto& trampoline = SKSE::GetTrampoline();
     (void)trampoline.write_call<5>(callSite, &GetOffsetDataSafe);
 
-    const auto rva = callSite - REL::Module::get().base();
-    if (fromTable) {
-        logger::info("SafeLookupPatch: patched editor-ID lookup call at +{:X} (table)", rva);
-    } else {
-        logger::warn("SafeLookupPatch: patched editor-ID lookup call at +{:X} (scan) — "
-                     "add this RVA to kSafeLookupCallSiteRVA for this runtime",
-                     rva);
-    }
+    logger::info("SafeLookupPatch: patched editor-ID lookup call at +{:X}",
+                 callSite - REL::Module::get().base());
     return true;
 }
 

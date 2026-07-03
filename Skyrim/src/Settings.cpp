@@ -21,9 +21,14 @@ Settings Settings::Load(const std::filesystem::path& a_iniPath)
     if (!std::filesystem::exists(a_iniPath)) {
         return s;
     }
-    const auto path = a_iniPath.wstring();
-    s.enablePatches         = ReadBool(L"Patches", L"EnablePatches",         s.enablePatches,         path);
-    s.findCellInFileLogging = ReadBool(L"Logging", L"FindCellInFileLogging", s.findCellInFileLogging, path);
+    // GetPrivateProfileIntW resolves non-fully-qualified paths against the
+    // WINDOWS directory, not the cwd — always hand it an absolute path.
+    std::error_code ec;
+    auto abs = std::filesystem::absolute(a_iniPath, ec);
+    const auto path = (ec ? a_iniPath : abs).wstring();
+    s.enablePatches         = ReadBool(L"Patches",  L"EnablePatches",         s.enablePatches,         path);
+    s.findCellInFileLogging = ReadBool(L"Logging",  L"FindCellInFileLogging", s.findCellInFileLogging, path);
+    s.showProgressWindow    = ReadBool(L"Progress", L"ShowProgressWindow",    s.showProgressWindow,    path);
     return s;
 }
 

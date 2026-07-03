@@ -18,6 +18,7 @@ namespace cog {
 namespace {
 
 std::thread                g_thread;
+std::atomic<bool>          g_enabled{ true };      // [Progress] ShowProgressWindow
 std::atomic<bool>          g_running{ false };     // window thread alive
 std::atomic<bool>          g_generating{ false };  // a real cache-miss happened → reveal
 std::atomic<std::uint32_t> g_done{ 0 };
@@ -159,8 +160,16 @@ void ThreadMain()
 
 }  // namespace
 
+void ProgressWindow::SetEnabled(bool a_enabled)
+{
+    g_enabled.store(a_enabled, std::memory_order_relaxed);
+}
+
 void ProgressWindow::Start(const char* a_title)
 {
+    if (!g_enabled.load(std::memory_order_relaxed)) {
+        return;  // user disabled the window; all other calls are no-ops
+    }
     if (g_running.exchange(true)) {
         return;  // already running
     }
