@@ -81,9 +81,8 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 )
 
 # ── MSVC-specific options ────────────────────────────────────────────────────
-if(CMAKE_GENERATOR MATCHES "Visual Studio")
+if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE
-        /MP4
         /W3
         /permissive-
         /Zc:preprocessor
